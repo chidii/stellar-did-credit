@@ -769,7 +769,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "vc not found")]
     fn test_mark_vc_revoked_panics_for_unknown_hash() {
         let env = Env::default();
         env.mock_all_auths();
@@ -786,8 +785,7 @@ mod tests {
         let known_hash = BytesN::from_array(&env, &[1u8; 32]);
         client.anchor_vc(&issuer, &subject, &known_hash);
 
-        let unknown_hash = BytesN::from_array(&env, &[2u8; 32]);
-        client.mark_vc_revoked(&issuer, &subject, &unknown_hash);
+        let unknown_hash = BytesN::from_array(&env, &[2u8; 32]);`n        let res = client.try_mark_vc_revoked(&issuer, &subject, &unknown_hash);`n        assert_eq!(res, Err(Ok(IdentityOracleError::VCNotFound)));
     }
 
     #[test]
