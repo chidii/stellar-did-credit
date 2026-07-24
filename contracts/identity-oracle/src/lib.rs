@@ -437,7 +437,7 @@ impl IdentityOracle {
         match pending {
             Some(p) => {
                 if p != new_admin {
-                    panic!("not authorized");
+                    return Err(IdentityOracleError::NotAuthorized);
                 }
             }
             None => return Err(IdentityOracleError::NoPendingAdmin),
@@ -454,7 +454,7 @@ impl IdentityOracle {
     pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
         let stored = require_admin(&env);
         if admin != stored {
-            panic!("not authorized");
+            return Err(IdentityOracleError::NotAuthorized);
         }
         env.deployer().update_current_contract_wasm(new_wasm_hash);
     }
