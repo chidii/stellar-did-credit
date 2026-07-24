@@ -321,7 +321,7 @@ impl IdentityOracle {
         }
 
         if !found {
-            panic!("vc not found");
+            return Err(IdentityOracleError::VCNotFound);
         }
 
         env.storage().persistent().set(&key, &updated);
@@ -437,7 +437,7 @@ impl IdentityOracle {
         match pending {
             Some(p) => {
                 if p != new_admin {
-                    panic!("not authorized");
+                    return Err(IdentityOracleError::NotAuthorized);
                 }
             }
             None => return Err(IdentityOracleError::NoPendingAdmin),
@@ -454,7 +454,7 @@ impl IdentityOracle {
     pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
         let stored = require_admin(&env);
         if admin != stored {
-            panic!("not authorized");
+            return Err(IdentityOracleError::NotAuthorized);
         }
         env.deployer().update_current_contract_wasm(new_wasm_hash);
     }
@@ -769,7 +769,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "vc not found")]
+    
     fn test_mark_vc_revoked_panics_for_unknown_hash() {
         let env = Env::default();
         env.mock_all_auths();
@@ -787,7 +787,7 @@ mod tests {
         client.anchor_vc(&issuer, &subject, &known_hash);
 
         let unknown_hash = BytesN::from_array(&env, &[2u8; 32]);
-        client.mark_vc_revoked(&issuer, &subject, &unknown_hash);
+        let res = client.try_mark_vc_revoked(&issuer, &subject, &unknown_hash);`n        assert_eq!(res, Err(Ok(IdentityOracleError::VCNotFound)));
     }
 
     #[test]
@@ -815,7 +815,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "not authorized")]
+    
     fn test_upgrade_rejects_non_admin() {
         let env = Env::default();
         env.mock_all_auths();
@@ -826,7 +826,7 @@ mod tests {
         let non_admin = Address::generate(&env);
         client.initialize(&admin);
         // Pass a zeroed hash — upgrade will fail on auth check before using it
-        client.upgrade(&non_admin, &BytesN::from_array(&env, &[0u8; 32]));
+        let res = client.try_upgrade(&non_admin, &BytesN::from_array(&env, &[0u8; 32]));`n        assert_eq!(res, Err(Ok(IdentityOracleError::NotAuthorized)));
     }
 
     #[test]
@@ -874,7 +874,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "not authorized")]
+    
     fn test_non_pending_admin_cannot_accept() {
         let env = Env::default();
         env.mock_all_auths();
@@ -889,6 +889,6 @@ mod tests {
         client.propose_new_admin(&admin1, &admin2);
 
         // non_admin tries to accept
-        let _ = client.accept_admin(&non_admin);
+        let res = client.try_accept_admin(&non_admin);`n        assert_eq!(res, Err(Ok(IdentityOracleError::NotAuthorized)));
     }
 }
