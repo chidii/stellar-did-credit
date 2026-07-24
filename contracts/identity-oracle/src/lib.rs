@@ -451,7 +451,7 @@ impl IdentityOracle {
     /// Upgrade the contract WASM in-place, preserving address and all stored state.
     ///
     /// Auth: admin only — verified via `require_admin`.
-    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) -> Result<(), IdentityOracleError> {
         let stored = require_admin(&env);
         if admin != stored {
             return Err(IdentityOracleError::NotAuthorized);
