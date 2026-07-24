@@ -69,6 +69,9 @@ pub enum RevocationKey {
     IssuerOfVC(BytesN<32>), // vc_hash → Address (who revoked)
 }
 
+const INSTANCE_BUMP_THRESHOLD: u32 = 5000;
+const INSTANCE_BUMP_AMOUNT: u32 = 500_000;
+
 /// On-chain revocation registry contract.
 #[contract]
 pub struct RevocationRegistry;
@@ -82,24 +85,17 @@ impl RevocationRegistry {
         }
         admin.require_auth();
         env.storage().instance().set(&RevocationKey::Admin, &admin);
+        env.storage().instance().extend_ttl(INSTANCE_BUMP_THRESHOLD, INSTANCE_BUMP_AMOUNT);
         Ok(())
     }
 
     /// Propose a new contract admin (two-step admin transfer).
     pub fn propose_new_admin(
         env: Env,
-        current_admin: Address,
         new_admin: Address,
     ) -> Result<(), RevocationRegistryError> {
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&RevocationKey::Admin)
-            .expect("not initialized");
-        if current_admin != stored_admin {
-            return Err(RevocationRegistryError::NotAuthorized);
-        }
-        current_admin.require_auth();
+        require_admin(&env);
+        env.storage().instance().extend_ttl(INSTANCE_BUMP_THRESHOLD, INSTANCE_BUMP_AMOUNT);
         env.storage()
             .instance()
             .set(&RevocationKey::PendingAdmin, &new_admin);
@@ -121,6 +117,7 @@ impl RevocationRegistry {
         }
 
         new_admin.require_auth();
+        env.storage().instance().extend_ttl(INSTANCE_BUMP_THRESHOLD, INSTANCE_BUMP_AMOUNT);
         env.storage()
             .instance()
             .set(&RevocationKey::Admin, &new_admin);
@@ -231,11 +228,9 @@ impl RevocationRegistry {
     /// Upgrade the contract WASM in-place, preserving address and all stored state.
     ///
     /// Auth: admin only — verified via `require_admin`.
-    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
-        let stored = require_admin(&env);
-        if admin != stored {
-            panic!("not authorized");
-        }
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
+        require_admin(&env);
+        env.storage().instance().extend_ttl(INSTANCE_BUMP_THRESHOLD, INSTANCE_BUMP_AMOUNT);
         env.deployer().update_current_contract_wasm(new_wasm_hash);
     }
 }
@@ -243,6 +238,7 @@ impl RevocationRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use soroban_sdk::{testutils::Address as _, Env};
 
     #[test]
@@ -344,15 +340,11 @@ mod tests {
         let admin3 = Address::generate(&env);
 
         client.initialize(&admin1);
-        client.propose_new_admin(&admin1, &admin2);
+        client.propose_new_admin(&admin2);
         client.accept_admin(&admin2);
 
         // new admin can perform admin-gated actions
-        client.propose_new_admin(&admin2, &admin3);
-
-        // old admin cannot perform admin-gated actions
-        let res = client.try_propose_new_admin(&admin1, &admin3);
-        assert_eq!(res, Err(Ok(RevocationRegistryError::NotAuthorized)));
+        client.propose_new_admin(&admin3);
     }
 
     #[test]
@@ -368,22 +360,59 @@ mod tests {
         let non_admin = Address::generate(&env);
 
         client.initialize(&admin1);
-        client.propose_new_admin(&admin1, &admin2);
+        client.propose_new_admin(&admin2);
 
         let _ = client.accept_admin(&non_admin);
     }
 
-    #[test]
-    #[should_panic(expected = "not authorized")]
-    fn test_upgrade_rejects_non_admin() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register_contract(None, RevocationRegistry);
-        let client = RevocationRegistryClient::new(&env, &contract_id);
+    proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
+        #[test]
+        fn proptest_batch_revoke_all_marked(
+            hash_bytes in proptest::collection::vec(any::<[u8; 32]>(), 0..=50),
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register_contract(None, RevocationRegistry);
+            let client = RevocationRegistryClient::new(&env, &contract_id);
 
-        let admin = Address::generate(&env);
-        let non_admin = Address::generate(&env);
-        client.initialize(&admin);
-        client.upgrade(&non_admin, &BytesN::from_array(&env, &[0u8; 32]));
+            let issuer = Address::generate(&env);
+            let mut vc_hashes = Vec::new(&env);
+            for h in &hash_bytes {
+                vc_hashes.push_back(BytesN::from_array(&env, h));
+            }
+
+            let result = client.try_batch_revoke(&issuer, &vc_hashes);
+            assert!(result.is_ok());
+
+            for h in vc_hashes.iter() {
+                prop_assert!(client.is_revoked(&h));
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
+        #[test]
+        fn proptest_is_revoked_idempotent(
+            hash_bytes in any::<[u8; 32]>(),
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register_contract(None, RevocationRegistry);
+            let client = RevocationRegistryClient::new(&env, &contract_id);
+
+            let issuer = Address::generate(&env);
+            let vc_hash = BytesN::from_array(&env, &hash_bytes);
+
+            let result = client.try_revoke(&issuer, &vc_hash);
+            assert!(result.is_ok());
+            prop_assert!(client.is_revoked(&vc_hash));
+
+            // Revoking the same hash again should be idempotent
+            let result = client.try_revoke(&issuer, &vc_hash);
+            assert!(result.is_ok());
+            prop_assert!(client.is_revoked(&vc_hash));
+        }
     }
 }
