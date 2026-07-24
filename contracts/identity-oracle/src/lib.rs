@@ -813,18 +813,17 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "not authorized")]
+    #[test]
     fn test_upgrade_rejects_non_admin() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register_contract(None, IdentityOracle);
         let client = IdentityOracleClient::new(&env, &contract_id);
-
         let admin = Address::generate(&env);
         let non_admin = Address::generate(&env);
         client.initialize(&admin);
-        // Pass a zeroed hash — upgrade will fail on auth check before using it
-        client.upgrade(&non_admin, &BytesN::from_array(&env, &[0u8; 32]));
+        let res = client.try_upgrade(&non_admin, &BytesN::from_array(&env, &[0u8; 32]));
+        assert_eq!(res, Err(Ok(IdentityOracleError::NotAuthorized)));
     }
 
     #[test]
@@ -872,21 +871,18 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "not authorized")]
+    #[test]
     fn test_non_pending_admin_cannot_accept() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register_contract(None, IdentityOracle);
         let client = IdentityOracleClient::new(&env, &contract_id);
-
         let admin1 = Address::generate(&env);
         let admin2 = Address::generate(&env);
         let non_admin = Address::generate(&env);
-
         client.initialize(&admin1);
         client.propose_new_admin(&admin1, &admin2);
-
-        // non_admin tries to accept
-        let _ = client.accept_admin(&non_admin);
+        let res = client.try_accept_admin(&non_admin);
+        assert_eq!(res, Err(Ok(IdentityOracleError::NotAuthorized)));
     }
 }
