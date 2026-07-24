@@ -831,6 +831,12 @@ mod tests {
         let admin = Address::generate(&env);
         client.initialize(&admin);
 
+        // Withdraw the blanket auth mock: with an empty auth list, admin's
+        // require_auth() inside require_admin() has nothing authorizing the
+        // invocation, so it fails before the call ever reaches
+        // deployer().update_current_contract_wasm() (which would separately
+        // fail on an unregistered hash regardless of auth — that's not what
+        // this test is checking).
         env.mock_auths(&[]);
         let res = client.try_upgrade(&BytesN::from_array(&env, &[0u8; 32]));
         assert!(res.is_err());
