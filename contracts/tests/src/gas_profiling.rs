@@ -176,5 +176,3 @@ mod tests {
             MAINNET_CPU_LIMIT
         );
     }
-
-}
