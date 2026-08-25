@@ -56,11 +56,11 @@ fn ensure_not_paused(env: &Env) -> Result<(), RevocationRegistryError> {
 
 /// Set the reentrancy lock.  Returns `ReentrancyDetected` if already held.
 fn enter_guard(env: &Env) -> Result<(), RevocationRegistryError> {
-    if env.storage().instance().has(&RevocationKey::ReentrancyLock) {
+    if env.storage().temporary().has(&RevocationKey::ReentrancyLock) {
         return Err(RevocationRegistryError::ReentrancyDetected);
     }
     env.storage()
-        .instance()
+        .temporary()
         .set(&RevocationKey::ReentrancyLock, &true);
     Ok(())
 }
@@ -68,7 +68,7 @@ fn enter_guard(env: &Env) -> Result<(), RevocationRegistryError> {
 /// Release the reentrancy lock.  Safe to call even if the lock is absent.
 fn exit_guard(env: &Env) {
     env.storage()
-        .instance()
+        .temporary()
         .remove(&RevocationKey::ReentrancyLock);
 }
 
