@@ -803,7 +803,7 @@ mod tests {
         // Simulate the lock being held (as if a cross-contract call is in flight).
         env.as_contract(&contract_id, || {
             env.storage()
-                .instance()
+                .temporary()
                 .set(&RevocationKey::ReentrancyLock, &true);
         });
 
