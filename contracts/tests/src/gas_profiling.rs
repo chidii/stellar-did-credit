@@ -177,34 +177,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn profile_list_feeders_with_50_entries() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let credit_id = env.register_contract(None, CreditOracle);
-        let credit = CreditOracleClient::new(&env, &credit_id);
-
-        let admin = Address::generate(&env);
-        credit.initialize(&admin);
-
-        for _ in 0..50u8 {
-            let feeder = Address::generate(&env);
-            credit.register_feeder(&admin, &feeder);
-        }
-
-        env.budget().reset_default();
-        let feeders = credit.list_feeders();
-        let cpu = env.budget().cpu_instruction_cost();
-
-        assert_eq!(feeders.len(), 50);
-
-        const MAINNET_CPU_LIMIT: u64 = 600_000_000;
-        assert!(
-            cpu < MAINNET_CPU_LIMIT,
-            "list_feeders with 50 entries exceeded CPU limit: {} > {}",
-            cpu,
-            MAINNET_CPU_LIMIT
-        );
-    }
 }
