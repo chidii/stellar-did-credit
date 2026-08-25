@@ -785,7 +785,7 @@ mod tests {
 
         // Lock must not be present after a successful call.
         let lock_present: bool = env.as_contract(&contract_id, || {
-            env.storage().instance().has(&RevocationKey::ReentrancyLock)
+            env.storage().temporary().has(&RevocationKey::ReentrancyLock)
         });
         assert!(
             !lock_present,
@@ -824,7 +824,7 @@ mod tests {
                 .set(&RevocationKey::ReentrancyLock, &true);
             exit_guard(&env);
             // After exit_guard the lock must be gone.
-            assert!(!env.storage().instance().has(&RevocationKey::ReentrancyLock));
+            assert!(!env.storage().temporary().has(&RevocationKey::ReentrancyLock));
             // And enter_guard must now succeed.
             assert!(enter_guard(&env).is_ok());
         });
