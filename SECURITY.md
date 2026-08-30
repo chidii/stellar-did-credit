@@ -55,3 +55,5 @@ This project follows [coordinated disclosure](https://en.wikipedia.org/wiki/Coor
 3. The CHANGELOG is updated under the affected release.
 
 We ask reporters to refrain from public disclosure until 30 days after a fix is released, or by mutual agreement if the timeline needs to change.
+
+For a detailed audit scope, see [AUDIT_SCOPE.md](AUDIT_SCOPE.md).
