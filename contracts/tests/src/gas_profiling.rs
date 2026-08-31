@@ -169,4 +169,39 @@ mod tests {
             MAINNET_CPU_LIMIT
         );
     }
+
+    #[test]
+    fn profile_list_issuers_after_deregistration_compaction() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let identity_id = env.register_contract(None, IdentityOracle);
+        let identity = IdentityOracleClient::new(&env, &identity_id);
+        let admin = Address::generate(&env);
+        identity.initialize(&admin);
+
+        let mut issuers = std::vec::Vec::new();
+        for _ in 0..50u8 {
+            let issuer = Address::generate(&env);
+            identity.register_issuer(&issuer);
+            issuers.push(issuer);
+        }
+
+        for issuer in issuers.iter().take(49) {
+            identity.deregister_issuer(issuer);
+        }
+
+        env.budget().reset_default();
+        let active = identity.list_issuers();
+        let cpu = env.budget().cpu_instruction_cost();
+
+        assert_eq!(active.len(), 1);
+        const MAINNET_CPU_LIMIT: u64 = 600_000_000;
+        assert!(
+            cpu < MAINNET_CPU_LIMIT,
+            "list_issuers after compaction exceeded CPU limit: {} > {}",
+            cpu,
+            MAINNET_CPU_LIMIT
+        );
+    }
 }

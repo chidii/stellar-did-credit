@@ -591,10 +591,8 @@ impl IdentityOracle {
     ///
     /// Does NOT retroactively revoke existing VCs anchored by this issuer.
     ///
-    /// This is a single tombstone write (`TrustedIssuer(issuer) = false`) —
-    /// it does not touch `IssuersIndex`, so cost does not scale with the
-    /// number of registered issuers. `list_issuers` is what hides
-    /// deregistered issuers from the returned set.
+    /// The issuer is tombstoned and removed from `IssuersIndex` by rebuilding
+    /// the index from the remaining trusted issuer flags.
     ///
     /// Auth: admin only — verified via `require_admin`.
     pub fn deregister_issuer(env: Env, issuer: Address) -> Result<(), IdentityOracleError> {
@@ -639,6 +637,11 @@ impl IdentityOracle {
         env.storage()
             .persistent()
             .set(&DataKey::IssuersIndex, &compacted);
+        env.storage().persistent().extend_ttl(
+            &DataKey::IssuersIndex,
+            PERS_TTL_THRESHOLD,
+            PERS_TTL_EXTEND,
+        );
 
         env.events().publish((symbol_short!("IssDeReg"),), issuer);
         Ok(())
@@ -1214,8 +1217,8 @@ impl IdentityOracle {
 
     /// Returns the currently registered (non-deregistered) trusted issuers.
     ///
-    /// `IssuersIndex` is append-only and may contain deregistered addresses,
-    /// so this filters it against each entry's live `TrustedIssuer` flag.
+    /// The index contains currently trusted issuers after deregistration
+    /// compaction; the flag check also keeps this safe for legacy indexes.
     pub fn list_issuers(env: Env) -> Vec<Address> {
         let ever_registered: Vec<Address> = env
             .storage()
@@ -1349,18 +1352,31 @@ mod tests {
 
         let issuer = Address::generate(&env);
         client.register_issuer(&issuer);
+
+        env.ledger().with_mut(|ledger| {
+            ledger.sequence_number += PERS_TTL_EXTEND - PERS_TTL_THRESHOLD + 1;
+        });
+
         client.deregister_issuer(&issuer);
 
-        // Deregistration tombstones the flag (sets it false) rather than
-        // removing the key, so `deregister_issuer` never has to rewrite
-        // IssuersIndex.
-        let is_trusted: bool = env.as_contract(&contract_id, || {
-            env.storage()
-                .persistent()
-                .get(&DataKey::TrustedIssuer(issuer.clone()))
-                .unwrap_or(true)
-        });
+        let (is_trusted, index_ttl, index): (bool, u32, Vec<Address>) =
+            env.as_contract(&contract_id, || {
+            let index_key = DataKey::IssuersIndex;
+            (
+                env.storage()
+                    .persistent()
+                    .get(&DataKey::TrustedIssuer(issuer.clone()))
+                    .unwrap_or(true),
+                env.storage().persistent().get_ttl(&index_key),
+                env.storage()
+                    .persistent()
+                    .get(&index_key)
+                    .unwrap_or(Vec::new(&env)),
+            )
+                    });
         assert!(!is_trusted);
+        assert!(index.is_empty());
+        assert!(index_ttl > PERS_TTL_THRESHOLD);
     }
 
     #[test]
@@ -1399,6 +1415,7 @@ mod tests {
 
         let issuer1 = Address::generate(&env);
         let issuer2 = Address::generate(&env);
+        let issuer3 = Address::generate(&env);
 
         assert_eq!(client.list_issuers(), Vec::new(&env));
 
@@ -1414,14 +1431,23 @@ mod tests {
             Vec::from_array(&env, [issuer1.clone(), issuer2.clone()])
         );
 
+        client.register_issuer(&issuer3);
+        assert_eq!(
+            client.list_issuers(),
+            Vec::from_array(&env, [issuer1.clone(), issuer2.clone(), issuer3.clone()])
+        );
+
         client.register_issuer(&issuer1);
         assert_eq!(
             client.list_issuers(),
-            Vec::from_array(&env, [issuer1.clone(), issuer2.clone()])
+            Vec::from_array(&env, [issuer1.clone(), issuer2.clone(), issuer3.clone()])
         );
 
         client.deregister_issuer(&issuer1);
-        assert_eq!(client.list_issuers(), Vec::from_array(&env, [issuer2]));
+        assert_eq!(
+            client.list_issuers(),
+            Vec::from_array(&env, [issuer2, issuer3])
+        );
     }
 
     #[test]
