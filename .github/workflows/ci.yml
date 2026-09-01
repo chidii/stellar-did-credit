@@ -26,8 +26,258 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
       
-      - name: Run tests
-        run: cargo test --workspace
+      - name: Run tests (regenerate snapshots if needed)
+        run: SOROBAN_TEST_SNAPSHOT_FILE_UPDATE=true cargo test --workspace
       
       - name: Run clippy
         run: cargo clippy --workspace -- -D warnings
+
+  contract-lint:
+    name: Contract lint (no bare panic!)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for bare panic!() in contract source
+        run: |
+          # Fail if bare panic!() exists in contract source files.
+          # Exemptions:
+          #   - contracts/tests/ (integration test crate, all code is test code)
+          #   - soroban_sdk::panic_with_error! (canonical Soroban error signal)
+          #   - Lines containing // panic (comments)
+          matches=$(grep -rn 'panic!' contracts/*/src/ --include='*.rs' \
+            | grep -v '^contracts/tests/' \
+            | grep -v 'panic_with_error!' \
+            | grep -v '//.*panic' || true)
+          if [ -n "$matches" ]; then
+            echo "ERROR: Found bare panic!() in contract source files:"
+            echo "$matches"
+            echo ""
+            echo "Use soroban_sdk::panic_with_error!() or return Err() instead."
+            echo "See CONTRIBUTING.md for guidelines."
+            exit 1
+          fi
+          echo "No bare panic!() found in contract source files."
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-fuzz-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+
+      - name: Run fuzz tests (credit-oracle)
+        run: cargo +nightly fuzz run compute_score_pure -- -runs=5000
+        working-directory: contracts/credit-oracle
+
+      - name: Run fuzz tests (identity-oracle)
+        run: cargo +nightly fuzz run anchor_vc_typed -- -runs=5000
+        working-directory: contracts/identity-oracle
+
+      - name: Run fuzz tests (governance)
+        run: cargo +nightly fuzz run vote_weight -- -runs=5000
+        working-directory: contracts/governance
+
+  ts-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Install SDK dependencies
+        run: pnpm install --frozen-lockfile
+        working-directory: packages/sdk
+
+      - name: Run TypeScript SDK tests
+        run: pnpm run test --coverage
+        working-directory: packages/sdk
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-docs-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Generate Rust API docs
+        run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Install SDK dependencies
+        run: pnpm install --frozen-lockfile
+        working-directory: packages/sdk
+
+      - name: Generate TypeScript API docs
+        run: pnpm run docs
+        working-directory: packages/sdk
+
+  license-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Check Node.js licenses
+        run: pnpm run license-check
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check Rust advisories
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Check Node.js dependencies for vulnerabilities
+        run: pnpm audit --audit-level=high
+
+  smoke-test:
+    name: Testnet smoke test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    continue-on-error: true
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-stellar-cli-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install stellar-cli
+        run: cargo install --locked stellar-cli --features opt
+
+      - name: Run testnet smoke test
+        env:
+          NETWORK: testnet
+          INVOKE_TIMEOUT_SECS: 30
+        run: bash scripts/smoke-test-testnet.sh deployments.testnet.json
+
+  check-wasm-sizes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-wasm-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build contracts (release)
+        run: >-
+          cargo build --target wasm32-unknown-unknown --release
+          -p identity-oracle
+          -p credit-oracle
+          -p credit-oracle-types
+          -p revocation-registry
+          -p score-range-verifier
+          -p governance
+
+      - name: Check WASM binary sizes
+        run: |
+          # Stellar's default WASM deployment limit is 512 KB (524,288 bytes).
+          # This check ensures all contract binaries stay under that threshold.
+          MAX_SIZE=$((512 * 1024))
+          FAILED=0
+          echo "Checking WASM binary sizes (max: $MAX_SIZE bytes / 512 KB)..."
+          echo ""
+          for wasm in target/wasm32-unknown-unknown/release/*.wasm; do
+            [ -f "$wasm" ] || continue
+            SIZE=$(stat -c%s "$wasm")
+            NAME=$(basename "$wasm")
+            if [ "$SIZE" -gt "$MAX_SIZE" ]; then
+              printf "FAIL: %-30s %d bytes (%.1f KB)\n" "$NAME" "$SIZE" "$(echo "scale=1; $SIZE / 1024" | bc)"
+              FAILED=1
+            else
+              printf "PASS: %-30s %d bytes (%.1f KB)\n" "$NAME" "$SIZE" "$(echo "scale=1; $SIZE / 1024" | bc)"
+            fi
+          done
+          echo ""
+          if [ "$FAILED" -eq 1 ]; then
+            echo "ERROR: One or more contracts exceed the 512 KB WASM deployment limit."
+            echo "See: https://developers.stellar.org/docs/soroban/deployment"
+            exit 1
+          fi
+          echo "All contracts are within the size limit."
+          

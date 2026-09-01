@@ -46,8 +46,11 @@ The primary statement Phase 4 targets:
 | `score` | `u32` | Final credit score (300–850) |
 | `vc_count` | `u32` | VC count at computation |
 | `tx_volume_30d` | `i128` | 30-day volume in stroops |
+| `avg_counterparties` | `u32` | Average distinct counterparties, 30d — **must** be part of the commitment; see soundness note below |
 | `repayment_rate` | `u32` | Basis points (0–10000) |
 | `last_updated` | `u64` | Ledger timestamp of computation |
+| `computed_at_ledger` | `u32` | Ledger sequence of computation |
+| `stale` | `bool` | Whether the score is stale at the time the proof is generated |
 | `vc_weight`, `tx_weight`, `repayment_weight` | `u32` | Weights active at computation |
 | `vc_score`, `tx_score`, `repay_score`, `counterparty_bonus` | `u32` | Intermediate component scores |
 | `composite` | `u32` | Weighted composite before final mapping |
@@ -74,10 +77,13 @@ composite == (vc_score * vc_w + (tx_score + counterparty_bonus) * tx_w + repay_s
 vc_score == min(vc_count * 20, 100)
 tx_score == min(tx_volume_30d / 100_000_000, 100)   // integer division
 repay_score == repayment_rate / 100
-score_commitment == Commit(score, vc_count, tx_volume_30d, repayment_rate, last_updated, blinding)
+counterparty_bonus == 10 if avg_counterparties >= 10 else 0
+score_commitment == Commit(score, vc_count, tx_volume_30d, avg_counterparties, repayment_rate, last_updated, computed_at_ledger, blinding)
 ```
 
 The on-chain verifier checks the SNARK **and** that public inputs match the invocation arguments. Binding `subject` and `credit_oracle_id` into the Fiat–Shamir transcript prevents proof reuse across accounts or deployments.
+
+> **Soundness note (added on review):** `avg_counterparties` must be part of `score_commitment`'s preimage, not just an unconstrained witness input. `vc_score`, `tx_score`, and `repay_score` are each pinned to committed `ScoreRecord` fields (`vc_count`, `tx_volume_30d`, `repayment_rate`), so a prover can't misreport them. `avg_counterparties` is not a `ScoreRecord` field today — it lives only on `TxStats` — so without this binding a prover could set `avg_counterparties >= 10` unconditionally and claim a `counterparty_bonus` the on-chain data doesn't support, inflating the proven score by up to 3 composite points undetected. See Open research question 11 below for the implementation path (extend `ScoreRecord`, vs. a separate `TxStats` commitment the verifier also checks).
 
 ### Extended statements (future)
 
@@ -86,7 +92,7 @@ The on-chain verifier checks the SNARK **and** that public inputs match the invo
 | Range | `600 ≤ score ≤ 700` for tiered loan products |
 | Equality | `score == 712` for audit disputes (subject opts in) |
 | Component bound | `repayment_rate ≥ 8000` without revealing score |
-| Freshness | `last_updated ≥ T` combined with score range |
+| Freshness | `last_updated ≥ T` or `computed_at_ledger ≥ L` combined with score range |
 
 ---
 
@@ -137,9 +143,11 @@ A hiding commitment lets the prover demonstrate range relations on `score` witho
 Map each `ScoreRecord` field to a field element and commit:
 
 ```
-C = score·G_score + vc_count·G_vc + tx_vol·G_tx + repay_rate·G_repay
-  + last_updated·G_ts + blinding·H
+C = score·G_score + vc_count·G_vc + tx_vol·G_tx + avg_cp·G_cp + repay_rate·G_repay
+  + last_updated·G_ts + computed_at_ledger·G_ledger + stale·G_stale + blinding·H
 ```
+
+`avg_cp` (average counterparties) is included so `counterparty_bonus` is bound to on-chain `TxStats` data rather than left as a free witness value — see the soundness note above.
 
 - **Hiding:** `blinding` prevents recovery of individual fields from `C`.
 - **Binding:** discrete-log assumption on the chosen curve.
@@ -152,7 +160,7 @@ C = score·G_score + vc_count·G_vc + tx_vol·G_tx + repay_rate·G_repay
 If [CAP-0075](https://github.com/stellar/stellar-protocol/blob/master/core/cap-0075.md) (Poseidon) is available on the target network:
 
 ```
-commitment = Poseidon(score, vc_count, tx_volume_30d, repayment_rate, last_updated, blinding)
+commitment = Poseidon(score, vc_count, tx_volume_30d, repayment_rate, last_updated, computed_at_ledger, stale, blinding)
 ```
 
 Poseidon is SNARK-friendly (few constraints) and aligns with future Stellar host functions. The circuit proves knowledge of preimage and the score relation simultaneously.
@@ -172,8 +180,10 @@ This adds a contract change but removes the need to trust off-chain witness sour
 | ------------------- | ---------------- |
 | `u32` | 32-bit integer in BN254 scalar field |
 | `i128` (`tx_volume_30d`) | Split into two `u64` limbs or range-check to protocol max |
+| `u32` (`avg_counterparties`) | 32-bit integer; only the `>= 10` comparison is constrained, value itself stays private |
 | `Address` | 32-byte public key hash as field element(s) |
 | `u64` (`last_updated`) | 64-bit integer |
+| `u32` (`computed_at_ledger`) | 32-bit integer |
 
 All arithmetic in the circuit must use **integer division semantics** matching the contract (see [scoring-spec.md](scoring-spec.md)).
 
@@ -348,6 +358,7 @@ impl ScoreRangeVerifier {
 8. **Ceremony operations:** Who runs the Groth16 trusted setup, and how is the resulting `vk_hash` governance-approved?
 9. **CAP-0074/0075 timeline:** Should Phase 4 wait for BN254/Poseidon host functions to simplify commitments inside the circuit?
 10. **Revocation interaction:** If a VC is revoked after proof generation, should lender policy re-check `is_verified` separately?
+11. **`avg_counterparties` binding:** `ScoreRecord` (returned by `get_score`) does not currently expose `avg_counterparties`, but the scoring formula's `counterparty_bonus` term depends on it. Should Phase 4 extend `ScoreRecord` with this field (contract change + deprecation path), or should the prover commit to `TxStats` separately and have the verifier check both commitments? The latter avoids a migration but adds a second commitment to manage; needs core-contributor input before circuit implementation starts.
 
 ---
 
@@ -376,6 +387,36 @@ impl ScoreRangeVerifier {
 | 5 | TypeScript prover module in SDK | Step 2 |
 | 6 | End-to-end integration test (testnet) | Steps 4–5 |
 | 7 | Optional Merkle binding to on-chain `ScoreRecord` | Research Q1 |
+
+### Step 1: Constraint count estimate (score > T circuit)
+
+The circuit is implemented in `zk/circuit/` (arkworks-rs, BLS12-381). The
+constraint budget below is derived from the actual R1CS constraints generated
+by the circuit.
+
+| Circuit component | Constraint count |
+| ----------------- | ---------------- |
+| `score > threshold` range proof (32-bit) | ~33 |
+| `vc_score == min(vc_points, 100)` | ~14 |
+| `volume_score == min(tx_volume_30d / 1e8, 80)` (integer division + range) | ~34 |
+| `counterparty_bonus == min(avg_counterparties / 5, 20)` (integer division) | ~8 |
+| `tx_score == min(volume_score + counterparty_bonus, 100)` | ~14 |
+| `repayment_rate_score` (integer division, 2 levels) | ~46 |
+| `repayment_volume_score == min(total_repaid / 1e8, 100)` | ~34 |
+| `repay_score == (rr_score + rv_score) / 2` | ~1 |
+| `composite == (vc·w_vc + tx·w_tx + repay·w_repay) / 100` | ~14 |
+| `score == 300 + composite·550 / 100` | ~14 |
+| Pedersen commitment binding (8 fields × 2 coords) | ~16 |
+| **Total** | **~228** |
+
+This is well within Soroban's resource limits for on-chain verification
+(Groth16 verification on BLS12-381 via CAP-0059 host functions is a single
+pairing check, independent of circuit size). The prover runs off-chain in WASM,
+so the constraint count only affects proof generation time, not on-chain cost.
+
+**Open Q #11 resolution:** `avg_counterparties` is bound into the Pedersen
+commitment preimage (8 committed fields) rather than a separate `TxStats`
+commitment. See [ADR-001](adr-001-avg-counterparties-binding.md).
 
 ---
 

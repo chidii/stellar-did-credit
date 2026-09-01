@@ -4,21 +4,9 @@ This guide shows how a credential issuer — a KYC provider, payroll platform, o
 
 The protocol stores only a 32-byte SHA-256 hash of the credential on-chain. The full JSON-LD document stays off-chain (on your servers or IPFS), preserving user privacy while making the credential verifiable by any third party who receives a copy.
 
-## Table of contents
-
-- [Prerequisites](#prerequisites)
-- [VC JSON-LD format](#vc-json-ld-format)
-- [Hashing the credential](#hashing-the-credential)
-- [Anchoring on-chain via the SDK](#anchoring-on-chain-via-the-sdk)
-- [Key management best practices](#key-management-best-practices)
-- [Revoking a credential](#revoking-a-credential)
-- [Full working example](#full-working-example)
-
----
-
 ## Prerequisites
 
-Before you can anchor credentials, the protocol admin must register your Stellar address as a trusted issuer by calling `register_issuer(admin, issuer_address)` on the identity-oracle contract. Until that transaction is confirmed, `anchor_vc` will reject your calls with `IssuerNotAuthorized`.
+Before you can anchor credentials, the protocol admin must register your Stellar address as a trusted issuer by calling `register_issuer(admin, issuer_address)` on the identity-oracle contract. For the admin-side setup flow, see the [admin setup](architecture.md#admin-setup) section in the architecture guide. Until that transaction is confirmed, `anchor_vc` will reject your calls with `IssuerNotAuthorized`.
 
 You will also need:
 
@@ -29,6 +17,16 @@ You will also need:
 ```bash
 npm install @stellar-did-credit/sdk @stellar/stellar-sdk
 ```
+
+## Table of contents
+
+- [Prerequisites](#prerequisites)
+- [VC JSON-LD format](#vc-json-ld-format)
+- [Hashing the credential](#hashing-the-credential)
+- [Anchoring on-chain via the SDK](#anchoring-on-chain-via-the-sdk)
+- [Key management best practices](#key-management-best-practices)
+- [Revoking a credential](#revoking-a-credential)
+- [Full working example](#full-working-example)
 
 ---
 
@@ -229,33 +227,29 @@ Your issuer keypair is a signing key that directly controls which credential has
 
 ## Revoking a credential
 
-If a credential is no longer valid (the user's KYC has lapsed, a document expired, or there was a data error), you must revoke it. Two paths exist:
+If a credential is no longer valid (the user's KYC has lapsed, a document expired, or there was a data error), you must revoke it.
 
-**Via the identity-oracle** (marks the hash as revoked in the VC record):
-
-```typescript
-// Not yet in the SDK — call via Soroban directly, or wait for revokeVC in SDK v0.2
-```
-
-**Via the revocation-registry** (independent on-chain registry that any verifier can check):
+You can revoke a credential using the SDK's `revokeVC` method, which atomically marks the credential hash as revoked in both the `revocation-registry` and the `identity-oracle`:
 
 ```typescript
-// anchor_vc does not automatically consult the revocation-registry;
-// the registry is intended for verifiers and lenders to query independently.
+try {
+  const txHash = await sdk.revokeVC(
+    issuerKeypair,
+    vcHash
+  );
+  console.log(`Credential revoked successfully. TX: ${txHash}`);
+} catch (error) {
+  console.error("Failed to revoke credential:", error);
+  // Handle specific errors, e.g., signature failure, authorization failure, or invalid VC hash
+}
 ```
 
-Until `revokeVC` is added to the SDK, you can invoke `mark_vc_revoked(issuer, subject, vc_hash)` on the identity-oracle contract directly using `stellar-cli`:
-
-```bash
-stellar contract invoke \
-  --id CXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX \
-  --source-account ISSUER_KEY_NAME \
-  --network testnet \
-  -- mark_vc_revoked \
-  --issuer YOUR_G_ADDRESS \
-  --subject SUBJECT_G_ADDRESS \
-  --vc_hash HEX_ENCODED_HASH
-```
+The SDK submits one Soroban operation to `revocation-registry.revoke`; the registry
+then calls `identity-oracle.mark_vc_revoked` within the same invocation. Soroban
+transactions execute atomically, so a contract error discards all state changes.
+`revokeVC` waits for final transaction confirmation and throws a descriptive error
+if either contract fails. See Stellar's
+[transaction simulation and atomicity documentation](https://developers.stellar.org/docs/learn/fundamentals/contract-development/contract-interactions/transaction-simulation).
 
 ---
 
@@ -279,3 +273,22 @@ See [`packages/issuer-example/README.md`](../packages/issuer-example/README.md) 
 - [Architecture overview](architecture.md) — how the three contracts interact
 - [W3C Verifiable Credentials Data Model](https://www.w3.org/TR/vc-data-model/)
 - [RFC 8785 — JSON Canonicalization Scheme](https://www.rfc-editor.org/rfc/rfc8785)
+
+## VC Anchor Limit
+
+Each subject can have a maximum of **100 active (non-revoked) VCs** anchored at any time.
+
+### What counts toward the limit
+- Any non-revoked VC anchored via `anchor_vc` or `anchor_vc_typed`
+
+### What does NOT count toward the limit
+- Revoked VCs (marked via `mark_vc_revoked`)
+- Duplicate (issuer, vc_hash) pairs (these are no-ops)
+
+### Recovery flow when the cap is reached
+1. The subject (or issuer) calls `mark_vc_revoked` on old/unused VCs
+2. Once active VC count drops below 100, new VCs can be anchored
+
+### Error
+If a new anchor would exceed the cap, the contract returns:
+`IdentityOracleError::VCLimitReached` (error code 10)

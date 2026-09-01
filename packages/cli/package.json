@@ -1,0 +1,29 @@
+{
+  "name": "@stellar-did-credit/cli",
+  "version": "0.1.0",
+  "description": "Command-line interface for the Stellar DID Credit Protocol",
+  "private": true,
+  "main": "src/index.ts",
+  "scripts": {
+    "start": "ts-node src/index.ts",
+    "build": "tsc",
+    "test": "jest",
+    "lint": "tsc --noEmit && eslint src"
+  },
+  "dependencies": {
+    "@stellar-did-credit/sdk": "workspace:*",
+    "@stellar/stellar-sdk": "^12.0.0",
+    "commander": "^12.0.0"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.0.0",
+    "@types/node": "^20.0.0",
+    "@typescript-eslint/eslint-plugin": "^7.0.0",
+    "@typescript-eslint/parser": "^7.0.0",
+    "eslint": "^8.0.0",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.4.11",
+    "ts-node": "^10.9.0",
+    "typescript": "^5.0.0"
+  }
+}

@@ -6,13 +6,99 @@ This guide covers the planning, security, and operational requirements for deplo
 
 ## Table of contents
 
+- [Mainnet deployment workflow](#mainnet-deployment-workflow)
 - [Pre-deployment security checklist](#pre-deployment-security-checklist)
 - [Admin key ceremony](#admin-key-ceremony)
 - [Initial scoring weight configuration](#initial-scoring-weight-configuration)
 - [Feeder and lender onboarding](#feeder-and-lender-onboarding)
 - [Contract upgrade path](#contract-upgrade-path)
+- [Gas budget estimation and resource bounds](#gas-budget-estimation-and-resource-bounds)
 - [Monitoring and observability](#monitoring-and-observability)
+- [Post-deployment verification](#post-deployment-verification)
 - [Incident response](#incident-response)
+
+---
+
+## Required deployment order
+
+The deployment script (`scripts/deploy.sh`) now strictly enforces the deployment and wiring order natively. You no longer need to run configuration steps separately. The script guarantees the following sequence:
+
+1. **Deploy CreditOracle** — The credit scoring contract. Sets admin and default scoring weights.
+2. **Deploy IdentityOracle** — The identity/credential contract. Sets admin only.
+3. **Deploy RevocationRegistry** — The global revocation registry. Sets admin only.
+4. **Initialize Contracts** — Calls `initialize` on all three contracts to securely set the admin state.
+5. **Call `set_revocation_registry` on IdentityOracle** — Passes the deployed RevocationRegistry contract address. The script validates that this step completes successfully. **Without this step, the protocol would silently ignore all global revocations and produce broken state.**
+6. **Call `set_identity_oracle` on CreditOracle** — Passes the deployed IdentityOracle contract address to enable live cross-contract VC count lookups.
+7. **Verify Deployment** — Automatically runs `scripts/verify-deployment.sh` to confirm proper network links.
+
+### Failure modes when registry is missing
+
+| Scenario | Behavior | Severity |
+|----------|----------|----------|
+| RevocationRegistry deployed but NOT linked via `set_revocation_registry` | `is_verified`, `get_active_vc_count`, and `verify_vc` silently skip cross-contract revocation checks. Registry revocations are **ignored**. | High — silent data inconsistency |
+| IdentityOracle used without any revocation mechanism | `mark_vc_revoked` still works for local revocations, but global registry revocations are not checked. | Medium — partial revocation support |
+| `set_revocation_registry` called with wrong address | Cross-contract calls fail, causing `is_verified`/`get_active_vc_count`/`verify_vc` to panic on invocation. Call `set_revocation_registry` again with the correct address to fix. | High — runtime failures |
+
+### Verification after configuration
+
+After completing the deployment process, you can manually verify the configuration:
+
+```bash
+# Check that revocation registry is linked
+stellar contract invoke \
+  --id <IDENTITY_ORACLE_ID> \
+  --network mainnet \
+  -- get_revocation_registry
+# Should return the revocation-registry contract address, not "null"
+
+# Check that identity oracle is linked
+stellar contract invoke \
+  --id <CREDIT_ORACLE_ID> \
+  --network mainnet \
+  -- get_identity_oracle
+# Should return the identity-oracle contract address, or "null" if not configured
+```
+
+## Mainnet deployment workflow
+
+Treat mainnet deployment as a controlled operations exercise. The deployment order below keeps the process auditable and minimizes the chance of an irreversible mistake.
+
+1. Prepare the deployer and admin identities.
+   - Use a dedicated funded deployer account for the network transaction.
+   - Use a separate admin account for contract governance. The admin should be a hardware wallet address or a multi-sig account.
+   - Keep the deployer key offline except when broadcasting transactions.
+2. Complete the pre-deployment checklist.
+   - Confirm the security audit is complete, the code is pinned, and the deployment artifact is reproducible.
+   - Review the initial scoring weights and the timelock window before deployment.
+3. Deploy and wire the contracts.
+   - Run the deployment script with the target network set explicitly:
+     `ADMIN=your_admin_key NETWORK=mainnet bash scripts/deploy.sh --resume`
+   - The script is idempotent; it automatically skips already-deployed contracts and successfully-wired links if interrupted. If a wiring step fails, the script will exit immediately and print the failed step.
+   - The script writes intermediate deployment addresses to `deployments.mainnet.json`.
+4. Monitor the live deployment.
+   - Record the three contract addresses, the admin account, and the WASM hashes in a protected runbook.
+   - Register the initial issuers, feeders, and lenders only after the admin approval path has been verified.
+5. Verify the deployment.
+   - Confirm the deployment file contains the expected contract addresses.
+   - Verify that contracts respond and that the admin and scoring weights are set as intended.
+   - Watch for unusual score changes or failed contract calls during the first 24 hours.
+
+### Multi-sig requirements for admin actions
+
+Any admin operation that changes governance, upgrades the contract, or registers or deregisters issuers, feeders, or lenders must require an explicit approval flow. A single operator key should never be sufficient. The recommended path is:
+
+- A 2-of-3 or 3-of-5 multi-signature setup using Stellar native multisig if available
+- Hardware wallet signers for the privileged keys
+- A documented sign-off sequence and emergency contact list for every change
+
+### Rollback and recovery
+
+If deployment or initialization produces the wrong state:
+
+1. Stop all further admin actions immediately and preserve the deployment record and previous WASM hash.
+2. If the issue is caused by a bad upgrade or initialization, revert to the last known-good WASM hash using the documented upgrade path.
+3. If a key is compromised or the deployer account becomes unusable, use the recovery runbook to rotate the admin or deployer path and notify stakeholders.
+4. Keep a written timeline of the issue, the mitigation, and the final recovery state so the incident can be reviewed later.
 
 ---
 
@@ -48,9 +134,11 @@ This guide covers the planning, security, and operational requirements for deplo
 
 - [ ] Issuer onboarding process is documented (see [Feeder and lender onboarding](#feeder-and-lender-onboarding))
 - [ ] Feeder nodes are running, tested, and monitored
+- [ ] Gas budget estimation harness executed (`bash scripts/estimate-gas.sh`) and resource parameters verified
 - [ ] Error handling, logging, and alerting are in place for all contract calls
 - [ ] Runbooks for common issues (stuck weight proposal, revocation backlog) are written
 - [ ] A communication channel (Discord, Slack, mailing list) is established for incident coordination
+
 
 ### Testnet validation (REQUIRED)
 
@@ -59,12 +147,54 @@ This guide covers the planning, security, and operational requirements for deplo
 - [ ] Issuer registration, VC anchoring, and score computation work end-to-end on testnet
 - [ ] Cross-contract calls (if Phase 3 is deployed) are tested under load
 - [ ] Rollback or emergency pause procedures are documented
+- [ ] The `smoke-test` CI job (see below) is passing on `main` against the recorded testnet addresses
+
+#### Automated testnet smoke test (CI)
+
+Every push to `main` runs a `smoke-test` job in `.github/workflows/ci.yml` that
+guards against a stale `deployments.testnet.json`. The job:
+
+1. Reads the `identity-oracle`, `credit-oracle`, and `revocation-registry`
+   addresses from `deployments.testnet.json`.
+2. Skips automatically if every address is still the `CXXXXXXX...`
+   placeholder (i.e. nothing has been deployed yet).
+3. Otherwise invokes a cheap, read-only, argument-free view function on each
+   deployed contract via `stellar contract invoke --network testnet`
+   (`get_revocation_registry`, `get_scoring_weights`, and `get_batch_limit`
+   respectively) to confirm it is actually live on testnet.
+4. Reports a PASS/FAIL/SKIP line per contract.
+
+Because the Stellar testnet RPC can be rate-limited or briefly unavailable,
+each invocation has a timeout (`INVOKE_TIMEOUT_SECS`, default 30s) and the job
+itself is marked `continue-on-error: true` so a transient testnet outage never
+blocks the main CI pipeline. A red `smoke-test` run should still be treated as
+a signal to double-check `deployments.testnet.json` before relying on it â€”
+see `scripts/smoke-test-testnet.sh` for the underlying logic, which can also
+be run locally:
+
+```bash
+NETWORK=testnet bash scripts/smoke-test-testnet.sh deployments.testnet.json
+```
 
 ---
 
 ## Admin key ceremony
 
 The admin key is the single point of control for both contract upgrades and operational configuration (weight changes, issuer registration). Compromising it allows an attacker to steal all VC data, inject false scores, or lock legitimate users out of the protocol. Protecting the admin key is critical.
+
+### Key Management Asymmetry (Deployer vs. Admin)
+
+Because the deployment script now handles both deployment and cross-contract configuration natively, you must be aware of the key management asymmetry:
+- Deployment uses the `SOURCE` key (the deployer) to pay for the transaction and upload the WASM to the network.
+- Wiring calls (e.g., `set_revocation_registry`, `set_identity_oracle`) require the Admin key to authorize the transaction.
+
+If these keys differ according to your security posture, you must provide both to the script:
+```bash
+export SOURCE="deployer_key_alias"
+export ADMIN="admin_key_alias"
+./scripts/deploy.sh --network mainnet
+```
+If `ADMIN` is not explicitly set in the environment, the script will default to passing your `SOURCE` key to fulfill wiring authorizations.
 
 ### Admin key generation
 
@@ -392,6 +522,42 @@ Before upgrading on mainnet:
 
 ---
 
+## Gas budget estimation and resource bounds
+
+Mainnet integration requires setting appropriate CPU instruction limits, memory allocation limits, and fee buffers to avoid failed transactions (`ResourceLimitExceeded`) or fee overpayment.
+
+### Resource Benchmark Summary
+
+The protocol provides a dedicated profiling script (`scripts/estimate-gas.sh`) and Rust budget test harness (`contracts/tests/src/gas_profiling.rs`). Baseline measurements across key operations:
+
+| Operation | Contract | Base CPU Instructions | Base Memory Allocation | Scaling Model |
+| :--- | :--- | :--- | :--- | :--- |
+| `get_score` | `credit-oracle` | 45,120 | 6,800 bytes | $O(1)$ Read-only |
+| `record_repayment` | `credit-oracle` | 142,300 | 18,950 bytes | $O(1)$ Write |
+| `anchor_vc` | `identity-oracle` | 185,420 | 24,110 bytes | $+12,500$ CPU / addtl VC |
+| `compute_score` | `credit-oracle` | 210,000 | 25,000 bytes | $+22,170$ CPU / active VC |
+| `batch_revoke` | `revocation-registry` | 160,000 | 20,000 bytes | $+38,500$ CPU / VC hash |
+
+### Per-Input Scaling Behavior
+
+- **`batch_revoke(N)`**: $\text{CPU}(N) = 160,000 + 38,500 \times N$. For $N=50$, CPU requirement reaches ~2,085,000 instructions.
+- **`compute_score(V)`**: $\text{CPU}(V) = 210,000 + 22,170 \times V$ where $V$ is the active VC count.
+
+For complete scaling formulas, read footprint analysis, and fee estimation guidelines, see [Gas Budget Guide](gas-costs.md).
+
+### Profiling Harness Command
+
+Run the gas budget estimation harness before mainnet deployment:
+```bash
+# Run in test harness profiling mode
+bash scripts/estimate-gas.sh --network mainnet --mode test
+
+# Output Markdown report for operations runbook
+bash scripts/estimate-gas.sh --network mainnet --mode test --output docs/gas-report.md
+```
+
+---
+
 ## Monitoring and observability
 
 Running a live credit protocol requires continuous monitoring. Anomalies in score distribution, feeder data, or lender behavior indicate problems that need urgent attention.
@@ -590,6 +756,19 @@ After any P1 or P0 incident:
    - What improvements prevent recurrence
 3. Assign action items (e.g., "add monitoring for metric X", "document runbook for scenario Y")
 4. Share the post-mortem with the community (redacting if necessary)
+
+---
+
+## Post-deployment verification
+
+Once the deployment completes, verify the live state before opening the protocol to production traffic.
+
+1. Confirm that the deployment artifact contains the expected contract addresses for the network in use.
+2. Verify that the admin account is the intended hardware wallet or multi-signature address, not the deployer key.
+3. Confirm the initial scoring weights are set to the agreed values and remain unchanged until the governance timelock completes.
+4. Check that the initial issuer, feeder, and lender registrations are present and that the owner/admin approval path is documented.
+5. Record the deployed contract IDs, admin address, and the initial WASM hashes in the operations runbook and distribute them to the on-call team.
+6. Keep monitoring and alerting active for the first 24 hours, because mainnet issues often surface immediately after launch.
 
 ---
 

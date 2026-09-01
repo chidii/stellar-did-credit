@@ -111,7 +111,44 @@ PRs opened against your own fork instead of the upstream repo will not be seen b
 - Snapshot files must be committed if code changes them
 - Follow conventional commit format (see below)
 - Reference the issue number in your PR description
-- Any PR that changes contract behavior, SDK methods, or public APIs must add an entry under `[Unreleased]` in [CHANGELOG.md](../CHANGELOG.md)
+- Any PR that changes contract behavior, SDK methods, or public APIs must add an entry under `[Unreleased]` in [CHANGELOG.md](CHANGELOG.md)
+
+## Changelog updates
+
+User-facing changes should be documented in [CHANGELOG.md](CHANGELOG.md) before opening a PR whenever a change affects behavior, public APIs, CLI output, or other visible project capabilities.
+
+- Add a bullet under the appropriate section of `[Unreleased]` in [CHANGELOG.md](CHANGELOG.md)
+- Follow the Keep a Changelog structure already used in the file: `Added`, `Changed`, `Deprecated`, `Removed`, or `Fixed`
+- Keep entries concise and user-focused, and include the issue or PR number at the end of the bullet (for example, `(#174)`)
+- Internal-only changes that are not user-visible usually do not need a changelog entry
+
+Example:
+
+- `sdk`: added a convenience helper for reading the latest score from the chain (#174)
+
+## No `panic!()` in contract logic
+
+**Bare `panic!()` is forbidden in contract source files** (`contracts/*/src/*.rs`) outside of `#[test]` blocks. CI enforces this via the `contract-lint` job.
+
+Allowed:
+- `return Err(ErrorVariant)`
+- `soroban_sdk::panic_with_error!(ErrorVariant)`
+- `expect("descriptive message")` in non-contract code
+- `env.storage().instance().get(&key).ok_or(ErrorVariant)?`
+- `env.storage().instance().get(&key).unwrap_or(default)`
+
+Forbidden:
+- `panic!("error message")`
+- `todo!()`, `unimplemented!()`, `unreachable!()`
+- `unwrap()` in contract logic
+- `env.storage().instance().get(&key).unwrap()`
+- `env.storage().persistent().get(&key).unwrap()`
+
+`panic_with_error!` is the Soroban-idiomatic way to abort execution with a typed contract error. Use it when a function signature cannot return `Result` (for example, legacy `initialize` functions that return `()`). Prefer returning `Result<(), ErrorType>` when possible.
+
+Use `.ok_or(ErrorType)?` to propagate a typed error when storage reads fail. Use `.unwrap_or(default)` only when a fallback value is well-defined and semantically correct (for example, optional configuration that was added in a later version).
+
+Test code (`#[cfg(test)]`, `#[test]`) is exempt from this rule.
 
 ## Auth pattern for initialize functions
 
@@ -119,12 +156,13 @@ All `initialize` functions in protocol contracts **must** follow this exact orde
 
 ```rust
 // Security pattern: check_already_initialized → admin.require_auth() → set_admin
-pub fn initialize(env: Env, admin: Address) {
+pub fn initialize(env: Env, admin: Address) -> Result<(), ContractError> {
     if env.storage().instance().has(&DataKey::Admin) {
-        panic!("already initialized");
+        return Err(ContractError::AlreadyInitialized);
     }
     admin.require_auth();
     env.storage().instance().set(&DataKey::Admin, &admin);
+    Ok(())
 }
 ```
 

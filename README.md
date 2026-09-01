@@ -19,6 +19,7 @@ A decentralized identity and credit scoring protocol built on Stellar. Users own
 - [Project structure](#project-structure)
 - [TypeScript SDK](#typescript-sdk)
 - [Feeder](#feeder)
+- [CLI](#cli)
 - [Roadmap](#roadmap)
 - [Security](#security)
 - [Contributing](#contributing)
@@ -47,7 +48,7 @@ A user generates a Stellar keypair. Their public key becomes their DID: `did:ste
 Trusted issuers — KYC providers, payroll platforms, microfinance institutions, mobile money operators — sign JSON-LD credentials attesting to facts about the user (identity verified, income range, previous repayment history). The SHA-256 hash of each credential is anchored on-chain. The credential itself stays off-chain, preserving privacy. See the [Issuer Integration Guide](docs/issuer-guide.md) for the full VC format, hashing process, and a working Node.js example.
 
 **3. Credit score computed on-chain**
-The credit-oracle Soroban contract aggregates anchored VC hashes, on-chain transaction statistics, and repayment records into a composite score from 300 to 850. Any lender, anchor, or verifier can query the score permissionlessly. The scoring weights are governed and upgradeable.
+The credit-oracle Soroban contract aggregates anchored VC hashes, on-chain transaction statistics, and repayment records into a composite score from 300 to 850. Any lender, anchor, or verifier can query the score permissionlessly. The scoring weights are governed via the on-chain governance contract (see [docs/governance.md](docs/governance.md)) and upgradeable through a double-timelock flow.
 
 ---
 
@@ -83,24 +84,24 @@ graph TB
 
 ## Contracts
 
-The protocol is composed of three Soroban smart contracts deployed on the Stellar network.
+The protocol is composed of four Soroban smart contracts deployed on the Stellar network.
 
 ### identity-oracle
 
 Manages decentralized identifiers and verifiable credential anchoring.
 
-| Function                                    | Description                                    |
-| ------------------------------------------- | ---------------------------------------------- |
-| `initialize(admin)`                         | Sets the contract admin                        |
-| `register_issuer(admin, issuer)`            | Adds a trusted VC issuer                       |
+| Function                                    | Description                                     |
+| ------------------------------------------- | ----------------------------------------------- |
+| `initialize(admin)`                         | Sets the contract admin                         |
+| `register_issuer(admin, issuer)`            | Adds a trusted VC issuer                        |
 | `deregister_issuer(admin, issuer)`          | Revokes a trusted issuer (existing VCs persist) |
-| `anchor_did(subject, did_doc_cid)`          | Stores the IPFS CID of a DID document          |
-| `anchor_vc(issuer, subject, vc_hash)`       | Anchors a VC hash from a trusted issuer        |
-| `is_verified(subject)`                      | Returns true if subject has ≥ 1 non-revoked VC |
-| `get_vc_count(subject)`                     | Returns the number of anchored VCs             |
-| `verify_vc(subject, vc_hash)`               | Checks if a specific VC hash is valid          |
-| `mark_vc_revoked(issuer, subject, vc_hash)` | Marks a VC as revoked                          |
-| `upgrade(admin, new_wasm_hash)`             | Upgrades the contract WASM in-place            |
+| `anchor_did(subject, did_doc_cid)`          | Stores the IPFS CID of a DID document           |
+| `anchor_vc(issuer, subject, vc_hash)`       | Anchors a VC hash from a trusted issuer         |
+| `is_verified(subject)`                      | Returns true if subject has ≥ 1 non-revoked VC  |
+| `get_vc_count(subject)`                     | Returns the number of anchored VCs              |
+| `verify_vc(subject, vc_hash)`               | Checks if a specific VC hash is valid           |
+| `mark_vc_revoked(issuer, subject, vc_hash)` | Marks a VC as revoked                           |
+| `upgrade(admin, new_wasm_hash)`             | Upgrades the contract WASM in-place             |
 
 ### credit-oracle
 
@@ -120,6 +121,24 @@ Computes and stores credit scores based on on-chain data.
 | `propose_weights(weights)`                           | Proposes new weights with 24h timelock             |
 | `apply_weights()`                                    | Applies pending weights after timelock expires     |
 | `get_scoring_weights()`                              | Returns current scoring weights                    |
+
+### governance
+
+On-chain proposal creation, weighted voting, and multi-step execution for updating credit-oracle scoring weights. Voting power is assigned by the contract admin (admin-registered voters, not token-weighted). Full documentation: [docs/governance.md](docs/governance.md).
+
+| Function                                                     | Description                                              |
+| ------------------------------------------------------------ | -------------------------------------------------------- |
+| `initialize(admin, credit_oracle, quorum_required)`          | Sets admin, oracle address, and default quorum           |
+| `accept_oracle_admin()`                                       | Accepts credit-oracle admin role (two-step transfer)     |
+| `create_proposal(proposer, weights, voting_period, delay)`   | Creates a weight-update proposal; returns proposal ID    |
+| `vote(voter, proposal_id, vote_for, vote_weight)`            | Casts a weighted vote on an open proposal                |
+| `execute(proposal_id)`                                        | After expiry + delay, queues weights in credit-oracle    |
+| `apply_weights()`                                             | Finalizes queued weights after credit-oracle timelock    |
+| `register_voter(admin, voter, weight)`                       | Admin registers a voter with a weight                    |
+| `update_voter_weight(admin, voter, weight)`                  | Admin updates or deregisters a voter (weight = 0)        |
+| `set_quorum(admin, quorum_required)`                         | Admin sets the default quorum for future proposals       |
+| `get_proposal(proposal_id)`                                  | Returns a proposal by ID                                 |
+| `cancel(canceller, proposal_id, reason)`                     | Emits a cancellation event (stub — no on-chain effect)   |
 
 ### revocation-registry
 
@@ -207,12 +226,11 @@ pnpm test
 ### Deploy to testnet
 
 ```bash
-# Fund your deployer key
-curl "https://friendbot.stellar.org/?addr=$(stellar keys address deployer)"
-
-# Deploy all three contracts
-bash scripts/deploy.sh
+# Fund your deployer key and deploy all three contracts in one step
+bash scripts/deploy.sh --fund
 ```
+
+If the deployer account is already funded, the script will skip the Friendbot step and proceed directly to deployment.
 
 Contract addresses will be saved to `deployments.testnet.json`.
 
@@ -245,6 +263,7 @@ pnpm build
 cargo test -p identity-oracle
 cargo test -p credit-oracle
 cargo test -p revocation-registry
+cargo test -p governance
 
 # Run integration tests only
 cargo test -p integration-tests
@@ -265,6 +284,8 @@ stellar-did-credit/
 │   │   └── src/lib.rs          # Score computation + repayment history
 │   ├── revocation-registry/
 │   │   └── src/lib.rs          # VC status list
+│   ├── governance/
+│   │   └── src/lib.rs          # On-chain proposals + voting for weight updates
 │   └── tests/
 │       └── src/integration_test.rs  # Cross-contract integration tests
 ├── packages/
@@ -277,6 +298,8 @@ stellar-did-credit/
 ├── docs/
 │   ├── architecture.md         # Full component breakdown
 │   ├── did-spec.md             # DID method specification
+│   ├── governance.md           # Governance contract: reference, integration, security
+│   ├── epoch-model.md          # TTL management, compute cooldown, weight timelock
 │   ├── issuer-guide.md         # Issuer integration guide (VC format, hashing, key management)
 │   ├── scoring-spec.md         # Scoring formula + worked examples
 │   └── zk-proof-design.md      # Phase 4 ZK selective disclosure design
@@ -292,9 +315,9 @@ stellar-did-credit/
 
 ## TypeScript SDK
 
-The `@stellar-did-credit/sdk` package provides a typed client for interacting with all three contracts from a TypeScript application.
+The `@stellar-did-credit/sdk` package provides a typed client for interacting with the core protocol contracts from a TypeScript application. Configure `governanceId` to use the proposal, voting, execution, and weight-application helpers through `sdk.governance`.
 
-```typescript
+````typescript
 import { StellarDIDCreditSDK } from "@stellar-did-credit/sdk";
 
 const sdk = new StellarDIDCreditSDK({
@@ -308,19 +331,25 @@ const sdk = new StellarDIDCreditSDK({
 
 // Read a credit score (read-only, no fees)
 const score = await sdk.getScore("G...");
-console.log(score.score); // e.g. 612
-```
+
+if (score) {
+  console.log(score.score); // e.g. 612
+} else {
+  console.log("No credit score has been computed for this subject yet.");
+}
+
+> **Note:** `sdk.getScore()` returns `null` if a score has not yet been computed for the subject. Always check for `null` before accessing properties on the returned value.
 
 ### SDK status
 
 | Method                           | Status         |
 | -------------------------------- | -------------- |
 | `getScore(address)`              | ✅ Implemented |
-| `isVerified(address)`            | 🚧 Open        |
+| `isVerified(address)`            | ✅ Implemented |
 | `anchorDID(keypair, cid)`        | 🚧 Open        |
 | `issueVC(issuer, subject, hash)` | 🚧 Open        |
 | `verifyVC(subject, hash)`        | ✅ Implemented |
-| `revokeVC(issuer, hash)`         | 📋 Planned     |
+| `revokeVC(issuer, hash)`         | ✅ Implemented |
 
 ---
 
@@ -335,6 +364,33 @@ A feeder is a registered off-chain service that periodically calls two credit-or
 | `set_vc_count(feeder, subject, count)` | **Deprecated**: Caches the active VC count. Use cross-contract lookup via `set_identity_oracle` instead. |
 | `update_tx_stats(feeder, subject, stats)` | Pushes 30-day Horizon payment stats (volume, tx count, counterparties) |
 
+### Migration path for set_vc_count deprecation
+
+The `set_vc_count` function is deprecated in favor of cross-contract VC count lookup via the identity-oracle. When the credit-oracle has an identity-oracle configured via `set_identity_oracle`, the feeder will automatically skip `set_vc_count` calls and a deprecation warning event (`VcCntDep`) will be emitted if the function is still called.
+
+#### For feeder operators:
+
+1. **No immediate action required** — The feeder automatically detects when cross-contract lookup is configured and skips `set_vc_count` calls.
+
+2. **Optional explicit configuration** — Add `skipLegacyVcCount: true` to your `FeederConfig` to explicitly disable `set_vc_count` calls regardless of identity-oracle configuration:
+
+```typescript
+const config: FeederConfig = {
+  // ... other config
+  skipLegacyVcCount: true,  // Explicitly skip set_vc_count calls
+};
+```
+
+3. **Monitor deprecation events** — Watch for `VcCntDep` events if you're still calling `set_vc_count` on an oracle with identity-oracle configured. These indicate redundant calls that should be eliminated.
+
+#### For credit-oracle operators:
+
+1. **Phase 1** — Deploy and configure identity-oracle via `set_identity_oracle`
+2. **Phase 2** — Feeders automatically stop calling `set_vc_count`  
+3. **Phase 3** — Future contract version will remove `set_vc_count` entirely
+
+The migration is backward-compatible — existing feeders continue to work without modification.
+
 ### Prerequisites
 
 1. **Register the feeder on-chain** — the credit-oracle admin must call `register_feeder(admin, FEEDER_PUBLIC_KEY)` once before the feeder can submit data.
@@ -347,7 +403,7 @@ cd packages/feeder
 cp .env.example .env
 # Edit .env: set FEEDER_SECRET, SUBJECTS, CREDIT_ORACLE_ID, IDENTITY_ORACLE_ID
 pnpm install
-```
+````
 
 ### Run
 
@@ -378,7 +434,10 @@ const config: FeederConfig = {
   pollIntervalMs: 3_600_000,
 };
 
-const feeder = new Feeder(config, Keypair.fromSecret("YOUR_STELLAR_SECRET_KEY"));
+const feeder = new Feeder(
+  config,
+  Keypair.fromSecret("YOUR_STELLAR_SECRET_KEY"),
+);
 const stop = feeder.start(); // begins polling; call stop() to halt
 ```
 
@@ -403,20 +462,324 @@ await feeder.runCycle();
 | revocation-registry     | ✅ Complete    | Batch revocation supported           |
 | TypeScript SDK          | 🚧 In progress | `getScore` done, rest open           |
 | Feeder                  | ✅ Complete    | Reference impl in `packages/feeder`  |
-| CLI tool                | 📋 Planned     |                                      |
+| CLI tool                | ✅ Complete    | `packages/cli`                       |
 | Cross-contract vc_count | 📋 Planned     |                                      |
 | ZK proof layer          | 📋 Research    |                                      |
 | Governance contract     | 📋 Planned     |                                      |
+| Component               | Status         | Notes                                                                |
+| ----------------------- | -------------- | -------------------------------------------------------------------- |
+| identity-oracle         | ✅ Complete    | All functions implemented and tested                                 |
+| credit-oracle           | ✅ Complete    | Scoring formula live on testnet                                      |
+| revocation-registry     | ✅ Complete    | Batch revocation supported                                           |
+| governance              | ✅ Complete    | Admin-registered voter weights, double timelock, see [docs/governance.md](docs/governance.md) |
+| TypeScript SDK          | 🚧 In progress | Core identity, credit, revocation, and governance helpers available |
+| Feeder                  | ✅ Complete    | Reference impl in `packages/feeder`                                  |
+| CLI tool                | 📋 Planned     |                                                                      |
+| Cross-contract vc_count | 📋 Planned     |                                                                      |
+| ZK proof layer          | 📋 Research    |                                                                      |
+| Token-weighted DAO vote | 📋 Planned     | Current governance uses admin-assigned weights; token model is future |
+
+---
+
+---
+
+## CLI
+
+The `@stellar-did-credit/cli` package provides a command-line interface for interacting with the protocol contracts directly from your terminal.
+
+### Installation
+
+```bash
+# From the repo root
+pnpm install
+
+# Run via ts-node
+cd packages/cli
+npx ts-node src/index.ts --help
+```
+
+Or add a shell alias for convenience:
+
+```bash
+alias stellar-did="npx ts-node $(pwd)/packages/cli/src/index.ts"
+```
+
+### Configuration
+
+Contract IDs are loaded from (in order of precedence):
+
+1. **Environment variables** (highest priority)
+2. **Config file** — `stellar-did-config.json` or `.stellar-did-rc.json` in the current working directory or `$HOME`
+3. **Built-in defaults** — Stellar testnet
+
+#### Environment variables
+
+| Variable                 | Description                              |
+| ------------------------ | ---------------------------------------- |
+| `IDENTITY_ORACLE_ID`     | identity-oracle contract address         |
+| `CREDIT_ORACLE_ID`       | credit-oracle contract address           |
+| `REVOCATION_REGISTRY_ID` | revocation-registry contract address     |
+| `GOVERNANCE_ID`          | governance contract address              |
+| `NETWORK_PASSPHRASE`     | Stellar network passphrase (default: testnet) |
+| `RPC_URL`                | Soroban RPC endpoint (default: testnet)  |
+| `SIM_ACCOUNT`            | Funded account for read-only simulations |
+
+#### Config file
+
+Create a `stellar-did-config.json` file:
+
+```json
+{
+  "identityOracleId": "C...",
+  "creditOracleId": "C...",
+  "revocationRegistryId": "C...",
+  "governanceId": "C...",
+  "networkPassphrase": "Test SDF Network ; September 2015",
+  "rpcUrl": "https://soroban-testnet.stellar.org"
+}
+```
+
+You can also use a `deployments.testnet.json`-style file with a `contracts` block:
+
+```json
+{
+  "contracts": {
+    "identity-oracle": "C...",
+    "credit-oracle": "C...",
+    "revocation-registry": "C...",
+    "governance": "C..."
+  }
+}
+```
+
+### Commands
+
+#### `anchor-did` — Anchor a DID document
+
+Stores the IPFS CID of a DID document on-chain in the identity-oracle contract.
+
+```bash
+stellar-did anchor-did <subject-secret> <did-doc-cid>
+
+# Example
+stellar-did anchor-did YOUR_STELLAR_SECRET_KEY QmExampleCid123
+```
+
+**Output:**
+```
+Anchoring DID for GXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX...
+  DID Doc CID: QmExampleCid123
+
+Success!
+  Transaction: abc123def456...
+  Explorer:    https://stellar.expert/explorer/testnet/tx/abc123def456...
+```
+
+#### `anchor-vc` — Anchor a Verifiable Credential
+
+Anchors a verifiable credential hash on-chain. Must be executed by a registered trusted issuer.
+
+```bash
+stellar-did anchor-vc <issuer-secret> <subject-address> <vc-hash> [--type <type>]
+
+# Example
+stellar-did anchor-vc YOUR_STELLAR_SECRET_KEY GXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2 --type kyc
+```
+
+**Output:**
+```
+Anchoring VC for GXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX on testnet...
+  Issuer:  GYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYY
+  VC Hash: a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2
+  Type:    kyc
+
+Success!
+  Transaction: abc123def456...
+  Explorer:    https://stellar.expert/explorer/testnet/tx/abc123def456...
+```
+
+#### `get-score` — Fetch a credit score
+
+Reads the on-chain credit score for a subject address (read-only, no fees).
+
+```bash
+stellar-did get-score <subject-address>
+
+# Example
+stellar-did get-score GXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+
+# JSON output
+stellar-did get-score --json GXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+```
+
+**Output:**
+```
+Fetching credit score for GXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX...
+
+┌─────────────────────────────────────┐
+│  Credit Score: 612                  │
+├─────────────────────────────────────┤
+│  VC Count:                       3  │
+│  Repayment Rate:            8000 bps│
+│  TX Volume (30d):    1000.0000000 XLM│
+│  Previous Score:               558  │
+│  Computed at Ledger:       1234567  │
+│  Last Updated:      2026-07-01T00...│
+│  Stale:                      false  │
+└─────────────────────────────────────┘
+```
+
+#### `verify-vc` — Verify a credential
+
+Checks whether a specific verifiable credential hash is valid and non-revoked on-chain (read-only, no fees).
+
+```bash
+stellar-did verify-vc <subject-address> <vc-hash>
+
+# Example
+stellar-did verify-vc GXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2
+```
+
+**Output:**
+```
+Verifying VC for GXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX...
+  VC Hash: a1b2c3d4...
+
+✅ VC is VALID and non-revoked on-chain.
+```
+
+#### `is-verified` — Check verification status
+
+Checks whether a subject has at least one active, non-revoked verifiable credential (read-only, no fees).
+
+```bash
+stellar-did is-verified <subject-address>
+
+# Example
+stellar-did is-verified GXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+```
+
+#### `vc-count` — Count active credentials
+
+Returns the number of active (non-revoked) verifiable credentials for a subject (read-only, no fees).
+
+```bash
+stellar-did vc-count <subject-address>
+```
+
+#### `vcs` — List credential anchors
+
+Lists every verifiable credential anchor for a subject, including revoked entries (read-only, no fees).
+
+```bash
+stellar-did vcs <subject-address>
+```
+
+#### `credential-type` — Fetch a credential type label
+
+Returns the credential type label anchored for a subject's VC hash (e.g. `kyc`, `employment`). Untyped credentials report `generic` (read-only, no fees).
+
+```bash
+stellar-did credential-type <subject-address> <vc-hash>
+
+# Example
+stellar-did credential-type GXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2
+```
+
+#### `did-doc` — Fetch a DID document CID
+
+Returns the IPFS CID of the DID document anchored for a subject (read-only, no fees).
+
+```bash
+stellar-did did-doc <subject-address>
+```
+
+#### `issuers` — List trusted issuers
+
+Lists all currently registered trusted credential issuers (read-only, no fees).
+
+```bash
+stellar-did issuers
+```
+
+#### `weights` — Show scoring weights
+
+Fetches the current scoring weights (VC, transaction, repayment) configured on the credit-oracle contract (read-only, no fees).
+
+```bash
+stellar-did weights
+```
+
+#### `compute-score` — Compute a credit score
+
+Submits a transaction to compute and persist a credit score on-chain. Requires a funded keypair to pay transaction fees.
+
+```bash
+stellar-did compute-score <payer-secret> <subject-address>
+
+# Example
+stellar-did compute-score YOUR_STELLAR_SECRET_KEY GXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+
+# JSON output
+stellar-did compute-score --json YOUR_STELLAR_SECRET_KEY G...
+```
+
+**Output:** (same format as `get-score`)
+
+#### `governance` — Protocol Governance
+
+Provides subcommands to create proposals, vote, execute, and apply weight changes. Requires `GOVERNANCE_ID` to be configured.
+
+**Create a proposal**
+```bash
+stellar-did governance create-proposal <proposer-secret> <vc-weight> <tx-weight> <repay-weight> [--voting-period <ledgers>] [--delay <ledgers>]
+
+# Example
+stellar-did governance create-proposal YOUR_STELLAR_SECRET_KEY 40 30 30
+```
+
+**Vote on a proposal**
+```bash
+stellar-did governance vote <voter-secret> <proposal-id> <for|against> <weight>
+
+# Example
+stellar-did governance vote YOUR_STELLAR_SECRET_KEY 1 for 100
+```
+
+**Execute a proposal**
+Queues a passing proposal's weights in the credit-oracle.
+```bash
+stellar-did governance execute <payer-secret> <proposal-id>
+```
+
+**Apply weights**
+Applies queued weights after the credit-oracle timelock expires (~24 hours).
+```bash
+stellar-did governance apply-weights <payer-secret>
+```
+
+**Show a proposal**
+```bash
+stellar-did governance show <proposal-id>
+
+# Example
+stellar-did governance show 1
+```
+
+**List proposals**
+```bash
+stellar-did governance list [--from <id>] [--limit <n>]
+```
 
 ---
 
 ## Roadmap
 
 **Phase 1 — Foundation (current)**
-Three core contracts deployed on testnet. TypeScript SDK for score reading. Passing CI.
+Four core contracts deployed on testnet. Governance contract live with admin-registered voters. TypeScript SDK for score reading. Passing CI.
 
 **Phase 2 — SDK & tooling (contributors)**
-Full TypeScript SDK with DID creation, VC issuance, and revocation. CLI tool for developers.
+Full TypeScript SDK with DID creation, VC issuance, revocation, and governance client helpers. CLI tool for developers.
 
 **Phase 3 — Cross-contract integration**
 credit-oracle reads `vc_count` directly from identity-oracle via cross-contract call. Score freshness enforcement.
@@ -424,8 +787,8 @@ credit-oracle reads `vc_count` directly from identity-oracle via cross-contract 
 **Phase 4 — Privacy layer**
 ZK proof circuit for selective score disclosure — prove "score > 650" without revealing the exact number or underlying credentials. Design document: [docs/zk-proof-design.md](docs/zk-proof-design.md).
 
-**Phase 5 — Governance**
-DAO contract for scoring weight upgrades. Token-weighted voting. Timelock on changes.
+**Phase 5 — Tokenized governance (future)**
+Token-weighted voting (SEP-41), stake delegation, and full DAO tooling. Replaces the current admin-registered voter model.
 
 **Phase 6 — Mainnet**
 Security audit. Mainnet deployment. Issuer onboarding program.
@@ -472,7 +835,9 @@ Full setup and guidelines: [CONTRIBUTING.md](CONTRIBUTING.md)
 - [Stellar Laboratory](https://laboratory.stellar.org)
 - [Stellar Expert (Testnet Explorer)](https://stellar.expert/explorer/testnet)
 - [Project Architecture](docs/architecture.md)
+- [Governance Contract Reference](docs/governance.md)
 - [Scoring Specification](docs/scoring-spec.md)
+- [Epoch Model (TTL, cooldown, timelock)](docs/epoch-model.md)
 - [DID Method Specification](docs/did-spec.md)
 - [Issuer Integration Guide](docs/issuer-guide.md)
 - [ZK Proof Layer Design (Phase 4)](docs/zk-proof-design.md)

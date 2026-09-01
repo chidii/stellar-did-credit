@@ -14,221 +14,139 @@ npm install @stellar-did-credit/sdk
 import { StellarDIDCreditSDK } from "@stellar-did-credit/sdk";
 
 const sdk = new StellarDIDCreditSDK({
-    identityOracleId: "C...",
-    creditOracleId: "C...",
-    revocationRegistryId: "C...",
-    networkPassphrase: "Test SDF Network ; September 2015",
-    rpcUrl: "https://soroban-testnet.stellar.org",
+  identityOracleId: "C...",
+  creditOracleId: "C...",
+  revocationRegistryId: "C...",
+  governanceId: "C...",
+  networkPassphrase: "Test SDF Network ; September 2015",
+  rpcUrl: "https://soroban-testnet.stellar.org",
+  simAccount: "G...",
 });
 
 const score = await sdk.getScore("G...");
-console.log(score.score); // e.g. 612
+if (score) {
+  console.log(score.score); // e.g. 612
+} else {
+  console.log("No score computed yet");
+}
 ```
 
-### Configuration options
+## Transaction reliability
 
-All fields except the five required IDs/URLs are optional.
+`anchorDID`, `issueVC`, `revokeVC`, and `computeScore` retry transient
+submission failures with exponential backoff starting at one second. The
+default is three retries after the initial submission attempt. Set
+`maxRetries` to `0` to disable submission retries.
 
-| Option            | Type     | Default          | Description                                              |
-| ----------------- | -------- | ---------------- | -------------------------------------------------------- |
-| `timeoutSeconds`  | `number` | `30`             | Transaction builder timeout (seconds)                    |
-| `maxRetries`      | `number` | `3`              | Max simulation retry attempts with exponential backoff   |
-| `baseFee`         | `string` | `BASE_FEE` (`"100"`) | Transaction base fee in stroops                     |
-
-```typescript
-const sdk = new StellarDIDCreditSDK({
-    identityOracleId: "C...",
-    creditOracleId: "C...",
-    revocationRegistryId: "C...",
-    networkPassphrase: "Test SDF Network ; September 2015",
-    rpcUrl: "https://soroban-testnet.stellar.org",
-    // Optional tuning for unstable network environments:
-    timeoutSeconds: 60,
-    maxRetries: 5,
-    baseFee: "1000",
-});
-```
+All four methods wait for a final on-chain transaction status before
+returning. `timeoutSeconds` sets the total confirmation deadline and defaults
+to 30 seconds. A transaction that remains pending or receives no RPC response
+before the deadline throws `SDKError` with code `TRANSACTION_TIMEOUT`.
 
 ## API
 
-### `computeScore(payerKeypair: Keypair, subjectAddress: string): Promise<ScoreRecord>`
+### `getScore(subjectAddress: string): Promise<ScoreRecord | null>`
 
-Submits `compute_score`, waits until the transaction is confirmed on-chain, then returns the full persisted `ScoreRecord` via `getScore` so callers do not need an extra fetch. If the transaction succeeds but the follow-up fetch unexpectedly fails, the SDK throws a descriptive error.
-
-> **Fee note:** `computeScore` submits a signed transaction and therefore costs a
-> transaction fee (deducted from `payerKeypair`). In contrast, `getScore` uses a
-> read-only simulation and is always free.
-
-```typescript
-const score = await sdk.computeScore(payerKeypair, "G...");
-console.log(score.score); // e.g. 612
-```
-
-### `getScore(subjectAddress: string): Promise<ScoreRecord>`
-
-Fetches the on-chain credit score for a subject address. Uses a read-only simulation — no signing or fees required.
+Fetches the on-chain credit score for a subject address. Uses a read-only simulation — no signing or fees required. Returns `null` if no score has been computed for this address.
 
 ```typescript
 interface ScoreRecord {
-    score: number; // 300–850
-    lastUpdated: number; // ledger timestamp
-    vcCount: number; // number of verified credentials
-    repaymentRate: number; // basis points (0–10000)
-    txVolume30d: bigint; // 30-day transaction volume in stroops
+  score: number; // 300–850
+  lastUpdated: number; // ledger timestamp
+  vcCount: number; // number of verified credentials
+  repaymentRate: number; // basis points (0–10000)
+  txVolume30d: bigint; // 30-day transaction volume in stroops
+  computedAtLedger: number; // ledger sequence when score was computed
+  stale: boolean; // true if score is older than STALE_LEDGER_AGE (~30 days)
 }
 ```
 
-### `getWeights(): Promise<ScoringWeights>`
+### `computeScore(payerKeypair: KeypairLike, subjectAddress: string): Promise<number>`
 
-Fetches the current scoring weights from the credit-oracle using a read-only simulation.
+Computes and persists a subject's credit score on-chain, then returns the numeric score (300–850). This method submits a transaction to call `compute_score`, waits for confirmation, and then fetches the updated score.
 
-```typescript
-const weights = await sdk.getWeights();
-console.log(weights.vcWeight, weights.txWeight, weights.repaymentWeight);
-```
+**Important: Cooldown Interaction**
+The `compute_score` contract method is protected by a configurable cooldown period (`ComputeCooldownLedgers`) to prevent spam and reduce computational load.
+- If you call `computeScore` while the cooldown is active, the method throws `SDKError` with code `COOLDOWN_ACTIVE`.
+- **Fresh Deployments**: Depending on the contract's configuration, the cooldown might apply immediately upon initialization. If your first `computeScore` call fails right after a fresh deployment, you may need to wait for the initial cooldown period (e.g., 1 ledger) to pass.
 
-### `verifyVC(subjectAddress: string, vcHash: Buffer): Promise<boolean>`
+#### Recommended Cooldown Settings
 
-Checks whether a specific 32-byte credential hash is valid for a subject. Uses a read-only simulation against the identity-oracle contract.
+The cooldown can be configured by the contract admin using `update_compute_cooldown`. The ideal setting depends on the environment:
 
-```typescript
-const isValid = await sdk.verifyVC("G...", vcHash);
-```
+| Environment | Recommended Cooldown (Ledgers) | Rationale |
+|-------------|--------------------------------|-----------|
+| **Development / Local** | `1` | Allows rapid testing and immediate score recomputation. |
+| **Testnet** | `100` (~8 minutes) | Balances testing convenience with realistic network conditions. |
+| **Mainnet** | `17280` (~24 hours) | Prevents spam, reduces fees, and aligns with typical score update frequencies. |
 
-### `getDIDDocument(subjectAddress: string): Promise<string | null>`
+### `revokeVC(issuerKeypair: KeypairLike, vcHash: Buffer): Promise<string>`
 
-Retrieves the anchored DID document CID for a subject. Returns `null` if no DID document has been anchored. Uses a read-only simulation against the identity-oracle contract.
-
-```typescript
-const didCid = await sdk.getDIDDocument("G...");
-if (didCid) {
-  console.log(`DID document CID: ${didCid}`);
-} else {
-  console.log("No DID document anchored");
-}
-```
-
-## SDK status
-
-| Method                                  | Status         |
-| --------------------------------------- | -------------- |
-| `computeScore(keypair, address)`        | ✅ Implemented |
-| `getScore(address)`                     | ✅ Implemented |
-| `getWeights()`                          | ✅ Implemented |
-| `verifyVC(subject, hash)`               | ✅ Implemented |
-| `getDIDDocument(address)`               | ✅ Implemented |
-| `isVerified(address)`                   | 🚧 Open        |
-| `anchorDID(keypair, cid)`               | ✅ Implemented |
-| `issueVC(issuer, subject, hash)`        | 🚧 Open        |
-| `revokeVC(issuer, hash)`                | 📋 Planned     |
-
-### Other methods (coming soon)
-
-
-- `issueVC(issuerKeypair, subjectAddress, vcHash)` — anchor a verifiable credential
-- `isVerified(subjectAddress)` — check if a subject has any active VC
-
-## Types
-
-Every contract struct is exported from the package entry point, so you can import
-the canonical types directly instead of redeclaring them in your own code:
+Submits a signed transaction to `revocation_registry.revoke(issuer, vc_hash)`
+and waits for final confirmation. The hash must be exactly 32 bytes.
 
 ```typescript
-import type {
-  ScoreRecord,
-  TxStats,
-  ScoringWeights,
-  RepaymentRecord,
-  VCRecord,
-  ProtocolConfig,
-} from "@stellar-did-credit/sdk";
+const txHash = await sdk.revokeVC(issuerKeypair, vcHash);
 ```
 
-| TypeScript type   | Source contract  | Soroban struct    |
-| ----------------- | ---------------- | ----------------- |
-| `ScoreRecord`     | credit-oracle    | `ScoreRecord`     |
-| `TxStats`         | credit-oracle    | `TxStats`         |
-| `ScoringWeights`  | credit-oracle    | `ScoringWeights`  |
-| `RepaymentRecord` | credit-oracle    | `RepaymentRecord` |
-| `VCRecord`        | identity-oracle  | `VCRecord`        |
-| `ProtocolConfig`  | — (SDK config)   | —                 |
+Use `confirmationTimeoutMs` and `pollIntervalMs` in `ProtocolConfig` to tune
+confirmation polling. Invalid hashes throw `SDKError` with code
+`INVALID_VC_HASH`; issuer mismatch failures use `NOT_REGISTERED_ISSUER`.
 
-### `ScoreRecord`
+### SDK Method Status Table
+
+| Method | Status | Description |
+|--------|--------|-------------|
+| `getScore` | ✅ Implemented | Read persisted score record from credit-oracle |
+| `computeScore` | ✅ Implemented | Compute subject credit score, returns `number` |
+| `anchorDID` | ✅ Implemented | Anchor a DID document IPFS CID on-chain |
+| `issueVC` | ✅ Implemented | Anchor a verifiable credential for a subject |
+| `revokeVC` | ✅ Implemented | Revoke a verifiable credential by hash |
+| `getDIDDocument` | ✅ Implemented | Fetch anchored DID document CID for a subject |
+| `isVerified` | ✅ Implemented | Check if a subject has active (non-revoked) VCs |
+| `verifyVC` | ✅ Implemented | Verify whether a subject has a specific active VC hash |
+| `getVCCount` | ✅ Implemented | Fetch count of active VCs for a subject |
+| `getWeights` | ✅ Implemented | Fetch contract scoring weight configuration |
+| `getRegisteredIssuers` | ✅ Implemented | List all registered trusted credential issuers |
+
+### Governance
+
+Set `governanceId` in `ProtocolConfig` to use the exported `GovernanceClient`
+through `sdk.governance`. The client wraps proposal creation, weighted voting,
+execution, application of scoring weights, and read-only proposal queries.
 
 ```typescript
-interface ScoreRecord {
-  score: number;        // u32  — credit score, bounded 300–850
-  lastUpdated: number;  // u64  — ledger timestamp of last computation
-  vcCount: number;      // u32  — number of verified credentials
-  repaymentRate: number;// u32  — repayment rate in basis points (0–10000)
-  txVolume30d: bigint;  // i128 — 30-day transaction volume in stroops
-}
+const proposalId = await sdk.governance.createProposal(
+  proposerKeypair,
+  { vcWeight: 50, txWeight: 25, repaymentWeight: 25 },
+  17_280,
+  17_280,
+);
+
+await sdk.governance.vote(voterKeypair, proposalId, true, 100n);
+const proposal = await sdk.governance.getProposal(proposalId);
+const recentProposals = await sdk.governance.listProposals(1n, 10);
+
+// After voting closes and the proposal execution delay expires:
+await sdk.governance.execute(payerKeypair, proposalId);
+
+// After the credit-oracle's additional approximately 24-hour timelock:
+await sdk.governance.applyWeights(payerKeypair);
 ```
 
-### `TxStats`
+Governance uses a double timelock. Voting closes at the proposal's
+`expiryLedger`, and `execute` is available only after that plus the proposal's
+`executionDelayLedgers`. A successful `execute` queues the weights in the
+credit-oracle; it does not activate them. Wait approximately 24 hours, or
+until the credit-oracle pending record's `effective_ledger`, before calling
+`applyWeights`.
 
-Transaction statistics supplied by a trusted feeder via `update_tx_stats`.
+Proposal IDs are 1-based. The first proposal has ID `1`; ID `0` is unused.
+Start `listProposals` with `1n` when scanning from the beginning.
 
-```typescript
-interface TxStats {
-  volume30d: bigint;        // i128 — 30-day transaction volume in stroops
-  txCount30d: number;       // u32  — number of transactions in last 30 days
-  avgCounterparties: number;// u32  — average distinct counterparties
-}
-```
-
-> **Note:** `volume30d` is intentionally typed as `bigint` because it maps to a
-> Soroban `i128`, whose range exceeds JavaScript's safe-integer limit.
-
-### `ScoringWeights`
-
-Weights used by the credit-oracle to compute a composite score. The three
-components always sum to `100`.
-
-```typescript
-interface ScoringWeights {
-  vcWeight: number;        // u32 — weight for the verified-credentials component
-  txWeight: number;        // u32 — weight for the transaction-history component
-  repaymentWeight: number; // u32 — weight for the repayment-history component
-}
-```
-
-### `RepaymentRecord`
-
-Per-subject repayment counters updated by trusted lenders via `record_repayment`.
-
-```typescript
-interface RepaymentRecord {
-  onTimeCount: number; // u32 — repayments made on time
-  totalCount: number;  // u32 — total recorded repayments
-}
-```
-
-### `VCRecord`
-
-On-chain anchor record for a verifiable credential, created via `anchor_vc`.
-
-```typescript
-interface VCRecord {
-  vcHash: Buffer;     // BytesN<32> — SHA-256 hash of the off-chain VC JSON
-  issuer: string;     // Address    — Stellar G... address of the issuer
-  anchoredAt: number; // u64        — ledger timestamp (Unix seconds)
-  revoked: boolean;   // bool       — issuer-set revocation flag
-}
-```
-
-### Soroban ↔ TypeScript mapping
-
-These are the conventions used across all exported types:
-
-| Soroban type | TypeScript type |
-| ------------ | --------------- |
-| `u32`        | `number`        |
-| `u64`        | `number`        |
-| `i128`       | `bigint`        |
-| `bool`       | `boolean`       |
-| `Address`    | `string`        |
-| `BytesN<32>` | `Buffer`        |
+`GovernanceProposal` mirrors the Rust contract struct. Its `id`, vote tallies,
+and `quorumRequired` fields are `bigint`, preserving Soroban `u64` and `i128`
+values without JavaScript precision loss.
 
 ## Error handling
 
@@ -258,14 +176,14 @@ try {
 
 ### Error types and handling
 
-| Error Type | Cause | Message Pattern | Recommended Action |
-|-----------|-------|-----------------|-------------------|
-| `SimulationError` | Contract call failed | `Simulation failed: ...` | Validate subject address format; check contract state |
-| `SimulationError` | Missing return value | `No return value in simulation result` | Verify RPC endpoint is compatible; check contract deployment |
-| `NetworkError` | RPC endpoint unreachable | `Failed to connect to RPC` | Retry with backoff; fallback to alternate RPC endpoint |
-| `NetworkError` | Request timeout | `Request timeout` | Increase timeout; check network connectivity |
-| Generic `Error` | Invalid subject address | `Invalid Stellar address` | Verify address starts with 'G' and is 56 chars |
-| Generic `Error` | Parsing failures | `Failed to parse response` | Log full response; file an issue if RPC format changed |
+| Error Type | Code | Cause | Recommended Action |
+|-----------|------|-------|-------------------|
+| `SDKError` | `COOLDOWN_ACTIVE` | Cooldown period is active | Wait for cooldown ledgers to pass before retrying |
+| `SDKError` | `TRANSACTION_FAILED` | Contract call or submission failed | Validate inputs; check contract state |
+| `SDKError` | `TRANSACTION_TIMEOUT` | Confirmation timed out | Increase `timeoutSeconds`; check network connectivity |
+| `SDKError` | `INVALID_VC_HASH` | VC hash is not exactly 32 bytes | Ensure `vcHash.length === 32` |
+| `SDKError` | `NOT_REGISTERED_ISSUER` | Issuer not registered | Register the issuer via governance |
+| `ScoreNotComputedError` | — | No score exists for address | Call `computeScore` first |
 
 ### Common error scenarios
 
@@ -294,17 +212,17 @@ try {
 **Network connectivity issues:**
 ```typescript
 async function getScoreWithRetry(address: string, maxRetries = 3) {
-    for (let attempt = 0; attempt < maxRetries; attempt++) {
-        try {
-            return await sdk.getScore(address);
-        } catch (error) {
-            if (attempt === maxRetries - 1) throw error;
-            // Exponential backoff: 1s, 2s, 4s
-            await new Promise(resolve =>
-                setTimeout(resolve, Math.pow(2, attempt) * 1000)
-            );
-        }
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      return await sdk.getScore(address);
+    } catch (error) {
+      if (attempt === maxRetries - 1) throw error;
+      // Exponential backoff: 1s, 2s, 4s
+      await new Promise(resolve => 
+        setTimeout(resolve, Math.pow(2, attempt) * 1000)
+      );
     }
+  }
 }
 ```
 
