@@ -762,7 +762,7 @@ export class ScoreNotComputedError extends Error {
  * Parse a Soroban ScVal representing an Option<ScoreRecord>.
  * Returns the ScoreRecord if Some, throws ScoreNotComputedError if None.
  */
-function parseScoreRecord(
+export function parseScoreRecord(
   scVal: xdr.ScVal,
 ): ScoreRecord | null {
   if (!scVal || (typeof scVal.switch === "function" && scVal.switch() === xdr.ScValType.scvVoid())) {
