@@ -3,6 +3,7 @@ import {
   ScoreNotComputedError,
   MIN_SCORE,
   MAX_SCORE,
+  parseScoreRecord,
 } from "./index";
 import type {
   ScoreRecord,
@@ -241,8 +242,6 @@ describe("StellarDIDCreditSDK", () => {
 
   describe("computeScore", () => {
     it("test_computeScore_returns_updated_record", async () => {
-      // Verify that computeScore submits compute_score, waits for confirmation,
-      // then returns the updated ScoreRecord from getScore.
       mockGetAccount.mockResolvedValue({ sequence: "10" });
       mockSendTransaction.mockResolvedValue({
         status: "PENDING",
@@ -250,7 +249,7 @@ describe("StellarDIDCreditSDK", () => {
       });
       mockGetTransaction.mockResolvedValue({ status: "SUCCESS" });
       mockSimulateTransaction
-        .mockResolvedValueOnce({ result: { retval: { value: null } } }) // compute_score sim
+        .mockResolvedValueOnce({ result: { retval: { value: null } } })
         .mockResolvedValueOnce({
           result: {
             retval: {
@@ -263,7 +262,7 @@ describe("StellarDIDCreditSDK", () => {
               },
             },
           },
-        }); // getScore sim
+        });
 
       const sdk = new StellarDIDCreditSDK(mockConfig);
       const result = await sdk.computeScore(
@@ -416,7 +415,6 @@ describe("StellarDIDCreditSDK", () => {
     it("throws ScoreNotComputedError when score has not been computed", async () => {
       const sdk = new StellarDIDCreditSDK(mockConfig);
 
-      // Mock the server and simulation to return "score not computed" error
       mockSimulateTransaction.mockResolvedValue({
         error: "score not computed",
       });
@@ -450,7 +448,6 @@ describe("StellarDIDCreditSDK", () => {
 
   describe("ProtocolConfig — timeoutSeconds, maxRetries, baseFee", () => {
     it("test_timeout_applied_to_transaction_builder", async () => {
-      // Arrange: custom timeoutSeconds; provide a valid sim response so getScore completes.
       const scoreRetval = {
         value: {
           score: 300,
@@ -480,9 +477,7 @@ describe("StellarDIDCreditSDK", () => {
 
     it("test_retry_succeeds_after_n_failures", async () => {
       jest.useFakeTimers();
-      // Arrange: first 2 calls return a non-success/non-error response
-      // (simulates a transient RPC glitch), 3rd call succeeds.
-      const TRANSIENT = {}; // neither error nor success
+      const TRANSIENT = {};
       const SUCCESS = {
         result: {
           retval: {
@@ -504,18 +499,14 @@ describe("StellarDIDCreditSDK", () => {
       const sdk = new StellarDIDCreditSDK({ ...mockConfig, maxRetries: 3 });
       const promise = sdk.getScore(subjectAddress);
 
-      // Advance timers past the two backoff sleeps (500ms + 1000ms)
       await jest.advanceTimersByTimeAsync(2000);
 
       const result = await promise;
       expect(result?.score).toBe(500);
-      // simulateTransaction must have been called 3 times (2 transient + 1 success)
       expect(mockSimulateTransaction).toHaveBeenCalledTimes(3);
     });
 
     it("test_retry_exhausted_throws_after_maxRetries", async () => {
-      // Use real timers but set maxRetries=0 so there are no sleeps at all —
-      // the loop runs exactly once (attempt 0), fails, and throws immediately.
       const TRANSIENT = {};
       mockSimulateTransaction.mockResolvedValue(TRANSIENT);
 
@@ -523,12 +514,10 @@ describe("StellarDIDCreditSDK", () => {
       await expect(sdk.getScore(subjectAddress)).rejects.toThrow(
         "Simulation returned unexpected response",
       );
-      // maxRetries=0 → 1 total attempt (just attempt 0)
       expect(mockSimulateTransaction).toHaveBeenCalledTimes(1);
     });
 
     it("test_custom_baseFee_forwarded_to_transaction_builder", async () => {
-      // Provide a valid sim response so getScore completes without error.
       mockSimulateTransaction.mockResolvedValue({
         result: {
           retval: {
@@ -565,11 +554,6 @@ describe("StellarDIDCreditSDK", () => {
 });
 
 describe("contract struct type exports", () => {
-  // These tests double as compile-time assertions: if any interface were not
-  // exported from the package entry point (./index), or if its shape drifted
-  // from the on-chain contract structs, this file would fail to type-check.
-  // The runtime expectations additionally verify the documented field types.
-
   it("exports TxStats with volume30d typed as bigint (Soroban i128)", () => {
     const stats: TxStats = {
       volume30d: 5_000_000_000n,
@@ -649,12 +633,6 @@ describe("contract struct type exports", () => {
 });
 
 describe("test_all_exports_are_defined", () => {
-  // Verifies that every public name from the SDK entry point has a defined
-  // runtime value. TypeScript interfaces (TxStats, ScoringWeights,
-  // RepaymentRecord, VCRecord, ScoreRecord, ProtocolConfig) have no runtime
-  // representation — their presence is guaranteed by the `import type` block
-  // at the top of this file, which causes a compile error if any type is
-  // missing from the barrel.
   it("exports MIN_SCORE and MAX_SCORE as defined numbers", () => {
     expect(MIN_SCORE).not.toBeUndefined();
     expect(MAX_SCORE).not.toBeUndefined();
@@ -676,8 +654,6 @@ describe("test_all_exports_are_defined", () => {
   });
 
   it("struct type imports compile without error (TxStats, ScoringWeights, RepaymentRecord, VCRecord, ScoreRecord, ProtocolConfig)", () => {
-    // If any of these types were missing from index.ts, TypeScript would
-    // refuse to compile this file, making the test suite fail at build time.
     const _txStats: TxStats = {
       volume30d: 0n,
       txCount30d: 0,
@@ -727,6 +703,9 @@ describe("parseScoreRecord", () => {
       vc_count: 5,
       repayment_rate: 9500,
       tx_volume_30d: 1000000,
+      previous_score: 720,
+      computed_at_ledger: 5000,
+      stale: false,
     };
 
     const scVal = { value: scoreRecord } as never;
@@ -738,6 +717,9 @@ describe("parseScoreRecord", () => {
     expect(result!.vcCount).toBe(5);
     expect(result!.repaymentRate).toBe(9500);
     expect(result!.txVolume30d).toBe(BigInt(1000000));
+    expect(result!.previousScore).toBe(720);
+    expect(result!.computedAtLedger).toBe(5000);
+    expect(result!.stale).toBe(false);
   });
 
   it("test_parseScoreRecord_throws_on_missing_field", () => {
@@ -746,13 +728,16 @@ describe("parseScoreRecord", () => {
       last_updated: 1234567890,
       vc_count: 5,
       repayment_rate: 9500,
-      // tx_volume_30d intentionally missing
+      tx_volume_30d: 1000000,
+      previous_score: 720,
+      computed_at_ledger: 5000,
+      // stale intentionally missing
     };
 
     const scVal = { value: scoreRecord } as never;
 
     expect(() => parseScoreRecord(scVal)).toThrow(
-      "parseScoreRecord: missing field 'tx_volume_30d' in ScoreRecord",
+      "parseScoreRecord: missing field 'stale' in ScoreRecord",
     );
   });
 });

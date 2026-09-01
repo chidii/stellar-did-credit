@@ -15,183 +15,561 @@ import { assembleTransaction } from "@stellar/stellar-sdk/rpc";
 export const MIN_SCORE = 300;
 export const MAX_SCORE = 850;
 
-/**
- * Credit score record returned by the credit-oracle `get_score` entrypoint.
- *
- * Maps to the `ScoreRecord` struct in `contracts/credit-oracle`.
- */
+export type NetworkType = 'testnet' | 'mainnet' | 'futurenet' | 'custom';
+
 export interface ScoreRecord {
-  /** Credit score value, bounded to {@link MIN_SCORE}–{@link MAX_SCORE}. Soroban `u32`. */
   score: number;
-  /** Ledger timestamp (Unix seconds) of the last score computation. Soroban `u64`. */
   lastUpdated: number;
-  /** Number of verified credentials counted toward the score. Soroban `u32`. */
   vcCount: number;
-  /** Repayment rate in basis points (0–10000). Soroban `u32`. */
   repaymentRate: number;
-  /** 30-day transaction volume in stroops. Soroban `i128`. */
   txVolume30d: bigint;
+  previousScore: number | null;
+  /** Ledger sequence number when this score was last computed. */
+  computedAtLedger: number;
+  /** Whether the score is considered stale. */
+  stale: boolean;
 }
 
-/**
- * Transaction statistics for a subject, as stored by the credit-oracle contract
- * and supplied by a trusted feeder via `update_tx_stats`.
- *
- * All fields contribute to the scoring formula. See docs/scoring-spec.md for details.
- */
 export interface TxStats {
-  /** Total transaction volume over the last 30 days, in stroops. Soroban `i128`. */
   volume30d: bigint;
-  /** Number of transactions in the last 30 days. Currently unused. Soroban `u32`. */
   txCount30d: number;
-  /** Average number of distinct counterparties. Awards up to 10 bonus points when >= 10.
-   *  Soroban `u32`.
-   */
   avgCounterparties: number;
 }
 
-/**
- * Weights used by the credit-oracle when computing a composite credit score.
- * By contract invariant the three weights always sum to 100.
- *
- * Maps to the `ScoringWeights` struct in `contracts/credit-oracle`.
- */
 export interface ScoringWeights {
-  /** Weight applied to the verified-credentials component (0–100). Soroban `u32`. */
   vcWeight: number;
-  /** Weight applied to the transaction-history component (0–100). Soroban `u32`. */
   txWeight: number;
-  /** Weight applied to the repayment-history component (0–100). Soroban `u32`. */
   repaymentWeight: number;
 }
 
-/**
- * Repayment counters tracked per subject by the credit-oracle contract and
- * updated by trusted lenders via `record_repayment`.
- *
- * Maps to the `RepaymentRecord` struct in `contracts/credit-oracle`.
- */
 export interface RepaymentRecord {
-  /** Number of repayments made on time. Soroban `u32`. */
   onTimeCount: number;
-  /** Total number of recorded repayments. Soroban `u32`. */
   totalCount: number;
+  totalRepaid: bigint;
 }
 
-/**
- * On-chain anchor record for a verifiable credential, as stored by the
- * identity-oracle contract and created via `anchor_vc`.
- *
- * Maps to the `VCRecord` struct in `contracts/identity-oracle`.
- */
 export interface VCRecord {
-  /** SHA-256 hash of the off-chain verifiable credential JSON. Soroban `BytesN<32>`. */
   vcHash: Buffer;
-  /** Stellar address (G...) of the issuer that anchored this credential. Soroban `Address`. */
   issuer: string;
-  /** Ledger timestamp (Unix seconds) when the credential was anchored. Soroban `u64`. */
   anchoredAt: number;
-  /** Whether the credential has been revoked by its issuer. Soroban `bool`. */
   revoked: boolean;
+}
+
+export interface GovernanceProposal {
+  id: bigint;
+  proposer: string;
+  proposedWeights: ScoringWeights;
+  votesFor: bigint;
+  votesAgainst: bigint;
+  expiryLedger: number;
+  executionDelayLedgers: number;
+  executed: boolean;
+  cancelled: boolean;
+  quorumRequired: bigint;
 }
 
 export interface ProtocolConfig {
   identityOracleId: string;
   creditOracleId: string;
   revocationRegistryId: string;
+  governanceId?: string;
   networkPassphrase: string;
   rpcUrl: string;
   simAccount: string;
-  /**
-   * Request timeout in seconds applied to all transaction builders via `setTimeout`.
-   * Defaults to `30`.
-   */
   timeoutSeconds?: number;
-  /**
-   * Maximum number of simulation retry attempts on transient RPC failures before
-   * the call is rejected. Uses exponential backoff between attempts.
-   * Defaults to `3`.
-   */
   maxRetries?: number;
-  /**
-   * Base fee in stroops applied to all transaction builders.
-   * Defaults to the Stellar SDK `BASE_FEE` constant (`"100"`).
-   */
   baseFee?: string;
+  confirmationTimeoutMs?: number;
+  pollIntervalMs?: number;
+  network?: NetworkType;
 }
 
-/** Extract the sequence number string from a Soroban RPC account response. */
-function getSequence(accountData: SorobanRpc.Api.GetAccountResponse): string {
-  // The RPC response object carries `sequence` as a string field at runtime.
-  // We narrow through `unknown` to avoid an unsafe `any` cast.
-  const data = accountData as unknown as { sequence: string };
-  return data.sequence;
-}
+export type Unsubscribe = () => void;
 
-/**
- * Simulate a transaction against the RPC, retrying up to `maxRetries` times
- * with exponential backoff (base 500 ms) on transient failures.
- *
- * A "transient failure" is any non-success simulation result that does NOT
- * contain an explicit contract error string.  Contract-level errors (e.g.
- * "score not computed") are surfaced immediately without retrying.
- *
- * @param server      - Soroban RPC server instance
- * @param tx          - Transaction to simulate
- * @param maxRetries  - Maximum retry attempts (default 3)
- * @returns The first successful simulation response
- * @throws The last simulation response / error after all retries are exhausted
- */
-async function simulateWithRetry(
-  server: SorobanRpc.Server,
-  tx: Parameters<typeof server.simulateTransaction>[0],
-  maxRetries = 3,
-): Promise<SorobanRpc.Api.SimulateTransactionResponse> {
-  let lastResult: SorobanRpc.Api.SimulateTransactionResponse | undefined;
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    const result = await server.simulateTransaction(tx);
-    if (SorobanRpc.Api.isSimulationSuccess(result)) {
-      return result;
-    }
-    // Surface explicit contract errors immediately — no point retrying.
-    if (SorobanRpc.Api.isSimulationError(result)) {
-      return result;
-    }
-    lastResult = result;
-    if (attempt < maxRetries) {
-      await sleep(500 * Math.pow(2, attempt)); // 500 ms, 1 s, 2 s …
-    }
+export type SDKErrorCode =
+  | "INVALID_VC_HASH"
+  | "MISSING_REVOCATION_REGISTRY"
+  | "NOT_REGISTERED_ISSUER"
+  | "TRANSACTION_FAILED"
+  | "TRANSACTION_TIMEOUT"
+  | "COOLDOWN_ACTIVE";
+
+// ---------------------------------------------------------------------------
+// Contract error hierarchy
+// ---------------------------------------------------------------------------
+
+/** Base class for typed errors returned by Soroban smart contracts. */
+export class ContractError extends Error {
+  constructor(
+    public readonly code: number,
+    public readonly contractName: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = "ContractError";
   }
-  // All retries exhausted — return the last result so callers can inspect it.
-  return lastResult as SorobanRpc.Api.SimulateTransactionResponse;
+}
+
+export class IdentityOracleError extends ContractError {
+  constructor(code: number, message: string) {
+    super(code, "identity-oracle", message);
+    this.name = "IdentityOracleError";
+  }
+}
+
+export class CreditOracleError extends ContractError {
+  constructor(code: number, message: string) {
+    super(code, "credit-oracle", message);
+    this.name = "CreditOracleError";
+  }
+}
+
+export class RevocationRegistryError extends ContractError {
+  constructor(code: number, message: string) {
+    super(code, "revocation-registry", message);
+    this.name = "RevocationRegistryError";
+  }
+}
+
+export class GovernanceError extends ContractError {
+  constructor(code: number, message: string) {
+    super(code, "governance", message);
+    this.name = "GovernanceError";
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Error code maps
+// ---------------------------------------------------------------------------
+
+const IDENTITY_ORACLE_ERROR_CODES: Record<number, string> = {
+  1: "AlreadyInitialized",
+  2: "NotAuthorized",
+  3: "IssuerNotRegistered",
+  4: "InvalidCID",
+  5: "NoPendingAdmin",
+  6: "DuplicateVC",
+  7: "VCNotFound",
+  8: "ContractPaused",
+  9: "InvalidRevocationRegistry",
+  10: "VCLimitReached",
+};
+
+const CREDIT_ORACLE_ERROR_CODES: Record<number, string> = {
+  1: "AlreadyInitialized",
+  2: "NotAuthorized",
+  3: "FeederNotRegistered",
+  4: "LenderNotRegistered",
+  5: "InvalidWeights",
+  6: "NoPendingAdmin",
+  7: "ComputeCooldownActive",
+  8: "DisputeAlreadyPending",
+  9: "DisputeNotFound",
+  10: "InvalidInputKey",
+  11: "InvalidIdentityOracle",
+  12: "ContractPaused",
+  13: "InvalidRecencyConfig",
+  14: "TimelockNotExpired",
+  15: "NoPendingWeights",
+  16: "NotInitialized",
+};
+
+const REVOCATION_REGISTRY_ERROR_CODES: Record<number, string> = {
+  1: "AlreadyInitialized",
+  2: "NotAuthorized",
+  3: "IssuerMismatch",
+  4: "NoPendingAdmin",
+  5: "BatchTooLarge",
+  6: "ContractPaused",
+  7: "ReentrancyDetected",
+  8: "InvalidBatchLimit",
+};
+
+const GOVERNANCE_ERROR_CODES: Record<number, string> = {
+  1: "AlreadyInitialized",
+  2: "NotAuthorized",
+  3: "ProposalNotFound",
+  4: "ProposalExpired",
+  5: "ProposalNotExpired",
+  6: "ProposalAlreadyExecuted",
+  7: "InvalidWeights",
+  8: "InvalidQuorum",
+  9: "InvalidVoteWeight",
+  10: "QuorumNotMet",
+  11: "TimelockNotExpired",
+  12: "VoterNotRegistered",
+  13: "InsufficientVoteWeight",
+  14: "ProposalAlreadyCancelled",
+};
+
+const ERROR_CODE_MAPS: Record<string, Record<number, string>> = {
+  "identity-oracle": IDENTITY_ORACLE_ERROR_CODES,
+  "credit-oracle": CREDIT_ORACLE_ERROR_CODES,
+  "revocation-registry": REVOCATION_REGISTRY_ERROR_CODES,
+  governance: GOVERNANCE_ERROR_CODES,
+};
+
+// ---------------------------------------------------------------------------
+// Contract error parsing
+// ---------------------------------------------------------------------------
+
+const CONTRACT_ERROR_RE = /Error\(Contract,\s*#(\d+)\)/i;
+
+export function parseContractErrorCode(errorString: string): number | null {
+  const match = CONTRACT_ERROR_RE.exec(errorString);
+  return match ? Number(match[1]) : null;
+}
+
+export function throwContractError(
+  errorString: string,
+  contractName:
+    | "identity-oracle"
+    | "credit-oracle"
+    | "revocation-registry"
+    | "governance",
+): never {
+  const code = parseContractErrorCode(errorString);
+  const codeMap = ERROR_CODE_MAPS[contractName];
+  const variantName = code !== null && codeMap ? codeMap[code] : undefined;
+  const message =
+    code !== null && variantName
+      ? `${variantName} (code ${code})`
+      : errorString;
+
+  switch (contractName) {
+    case "identity-oracle":
+      throw new IdentityOracleError(code ?? 0, message);
+    case "credit-oracle":
+      throw new CreditOracleError(code ?? 0, message);
+    case "revocation-registry":
+      throw new RevocationRegistryError(code ?? 0, message);
+    case "governance":
+      throw new GovernanceError(code ?? 0, message);
+  }
+}
+
+export class SDKError extends Error {
+  constructor(
+    public readonly code: SDKErrorCode,
+    message: string,
+    options?: {
+      cause?: unknown;
+      transactionHash?: string;
+      resultXdr?: string;
+    },
+  ) {
+    super(message);
+    if (options?.cause !== undefined) {
+      this.cause = options.cause;
+    }
+    this.transactionHash = options?.transactionHash;
+    this.resultXdr = options?.resultXdr;
+    this.name = "SDKError";
+  }
+
+  declare readonly cause?: unknown;
+  declare readonly transactionHash?: string;
+  declare readonly resultXdr?: string;
+}
+
+export interface BatchChunkResult {
+  chunkIndex: number;
+  vcHashes: Buffer[];
+  status: "fulfilled" | "rejected";
+  transactionHash?: string;
+  error?: SDKError;
+}
+
+export interface BatchResult {
+  success: boolean;
+  failedChunks: number;
+  transactionHashes: string[];
+  chunks: BatchChunkResult[];
+}
+
+const NETWORK_CONFIGS: Record<Exclude<NetworkType, 'custom'>, Partial<ProtocolConfig>> = {
+  testnet: {
+    networkPassphrase: "Test SDF Network ; September 2015",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    simAccount: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+  },
+  mainnet: {
+    networkPassphrase: "Public Global Stellar Network ; September 2015",
+    rpcUrl: "https://soroban-rpc.mainnet.stellarchain.io",
+    simAccount: "",
+  },
+  futurenet: {
+    networkPassphrase: "Test SDF Future Network ; October 2022",
+    rpcUrl: "https://rpc-futurenet.stellar.org",
+    simAccount: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+  },
+};
+
+export type KeypairLike = Keypair | { publicKey: string };
+
+export function createNetworkConfig(
+  network: NetworkType,
+  overrides: Partial<ProtocolConfig> = {}
+): Partial<ProtocolConfig> {
+  if (network === 'custom') {
+    return overrides;
+  }
+  
+  const networkDefaults = NETWORK_CONFIGS[network];
+  return {
+    ...networkDefaults,
+    ...overrides,
+  };
+}
+
+export type GovernanceInteger = number | bigint;
+
+export class GovernanceClient {
+  private readonly server: SorobanRpc.Server;
+
+  constructor(
+    private readonly config: ProtocolConfig,
+    server?: SorobanRpc.Server,
+  ) {
+    this.server = server ?? new SorobanRpc.Server(config.rpcUrl);
+  }
+
+  async createProposal(
+    proposerKeypair: Keypair,
+    weights: ScoringWeights,
+    votingPeriodLedgers: number,
+    executionDelayLedgers: number,
+  ): Promise<bigint> {
+    const proposer = getPublicKey(proposerKeypair);
+    const contract = this.governanceContract();
+    const result = await this.submitSignedTransaction(
+      proposerKeypair,
+      contract.call(
+        "create_proposal",
+        new Address(proposer).toScVal(),
+        scoringWeightsToScVal(weights),
+        nativeToScVal(votingPeriodLedgers, { type: "u32" }),
+        nativeToScVal(executionDelayLedgers, { type: "u32" }),
+      ),
+      "createProposal",
+    );
+
+    if (!result.retval) {
+      throw new Error("createProposal returned no proposal ID");
+    }
+    return BigInt(scValToNative(result.retval) as bigint | number | string);
+  }
+
+  async vote(
+    voterKeypair: Keypair,
+    proposalId: GovernanceInteger,
+    voteFor: boolean,
+    voteWeight: GovernanceInteger,
+  ): Promise<string> {
+    const voter = getPublicKey(voterKeypair);
+    const contract = this.governanceContract();
+    return (
+      await this.submitSignedTransaction(
+        voterKeypair,
+        contract.call(
+          "vote",
+          new Address(voter).toScVal(),
+          nativeToScVal(toUnsignedBigInt(proposalId), { type: "u64" }),
+          nativeToScVal(voteFor),
+          nativeToScVal(toPositiveBigInt(voteWeight), { type: "i128" }),
+        ),
+        "vote",
+      )
+    ).hash;
+  }
+
+  async execute(
+    payerKeypair: Keypair,
+    proposalId: GovernanceInteger,
+  ): Promise<string> {
+    const contract = this.governanceContract();
+    return (
+      await this.submitSignedTransaction(
+        payerKeypair,
+        contract.call(
+          "execute",
+          nativeToScVal(toUnsignedBigInt(proposalId), { type: "u64" }),
+        ),
+        "execute",
+      )
+    ).hash;
+  }
+
+  async applyWeights(payerKeypair: Keypair): Promise<string> {
+    const contract = this.governanceContract();
+    return (
+      await this.submitSignedTransaction(
+        payerKeypair,
+        contract.call("apply_weights"),
+        "applyWeights",
+      )
+    ).hash;
+  }
+
+  async getProposal(
+    proposalId: GovernanceInteger,
+  ): Promise<GovernanceProposal | null> {
+    const contract = this.governanceContract();
+    const retval = await this.simulateRead(
+      contract.call(
+        "get_proposal",
+        nativeToScVal(toUnsignedBigInt(proposalId), { type: "u64" }),
+      ),
+    );
+    const native = scValToNative(retval);
+    return native === null || native === undefined
+      ? null
+      : parseGovernanceProposal(native);
+  }
+
+  async listProposals(
+    fromId: GovernanceInteger,
+    limit: number,
+  ): Promise<GovernanceProposal[]> {
+    if (!Number.isInteger(limit) || limit < 0) {
+      throw new Error("limit must be a non-negative integer");
+    }
+
+    const firstId = toUnsignedBigInt(fromId);
+    const proposals: GovernanceProposal[] = [];
+    for (let offset = 0n; offset < BigInt(limit); offset += 1n) {
+      const proposal = await this.getProposal(firstId + offset);
+      if (proposal) {
+        proposals.push(proposal);
+      }
+    }
+    return proposals;
+  }
+
+  private governanceContract(): Contract {
+    if (!this.config.governanceId?.trim()) {
+      throw new Error(
+        "governanceId is required to use the governance client",
+      );
+    }
+    return new Contract(this.config.governanceId);
+  }
+
+  private async simulateRead(operation: xdr.Operation): Promise<xdr.ScVal> {
+    const sourceAccount = new Account(this.config.simAccount, "0");
+    const tx = new TransactionBuilder(sourceAccount, {
+      fee: this.config.baseFee ?? BASE_FEE,
+      networkPassphrase: this.config.networkPassphrase,
+    })
+      .addOperation(operation)
+      .setTimeout(this.config.timeoutSeconds ?? 30)
+      .build();
+
+    const sim = await this.server.simulateTransaction(tx);
+    if (SorobanRpc.Api.isSimulationError(sim)) {
+      throwContractError(sim.error, "governance");
+    }
+    if (!SorobanRpc.Api.isSimulationSuccess(sim)) {
+      throw new Error("Simulation returned unexpected response");
+    }
+    const retval = sim.result?.retval;
+    if (!retval) {
+      throw new Error("No return value in simulation result");
+    }
+    return retval;
+  }
+
+  private async submitSignedTransaction(
+    keypair: Keypair,
+    operation: xdr.Operation,
+    operationName: string,
+  ): Promise<{ hash: string; retval?: xdr.ScVal }> {
+    const publicKey = getPublicKey(keypair);
+    const accountData = await this.server.getAccount(publicKey);
+    const sourceAccount = new Account(
+      publicKey,
+      accountData.sequenceNumber(),
+    );
+    const tx = new TransactionBuilder(sourceAccount, {
+      fee: this.config.baseFee ?? BASE_FEE,
+      networkPassphrase: this.config.networkPassphrase,
+    })
+      .addOperation(operation)
+      .setTimeout(this.config.timeoutSeconds ?? 30)
+      .build();
+
+    const sim = await this.server.simulateTransaction(tx);
+    if (SorobanRpc.Api.isSimulationError(sim)) {
+      throwContractError(sim.error, "governance");
+    }
+    if (!SorobanRpc.Api.isSimulationSuccess(sim)) {
+      throw new Error(`${operationName} simulation returned unexpected response`);
+    }
+
+    const retval = sim.result?.retval;
+    const preparedTx = SorobanRpc.assembleTransaction(tx, sim).build();
+    preparedTx.sign(keypair);
+    const response = await this.server.sendTransaction(preparedTx);
+    if (response.status !== "PENDING") {
+      throw new Error(
+        `${operationName} transaction submission failed: ${response.errorResult}`,
+      );
+    }
+
+    await waitForTransactionConfirmation(
+      this.server,
+      response.hash,
+      operationName,
+    );
+    return { hash: response.hash, retval };
+  }
 }
 
 export class StellarDIDCreditSDK {
-  constructor(private config: ProtocolConfig) {}
+  private server: SorobanRpc.Server;
+  public readonly governance: GovernanceClient;
 
-  /**
-   * Anchor a DID document on-chain by storing its IPFS CID.
-   *
-   * Submits a signed transaction to the identity-oracle contract. Requires the subject
-   * keypair to authorize the operation.
-   *
-   * @param subjectKeypair - Stellar keypair of the subject (private + public key)
-   * @param didDocCid - IPFS CID of the DID document (e.g. "Qm...")
-   * @returns Transaction hash on successful submission
-   */
-  async anchorDID(subjectKeypair: Keypair, didDocCid: string): Promise<string> {
-    const server = new SorobanRpc.Server(this.config.rpcUrl);
+  constructor(config: ProtocolConfig) {
+    if (config.network && config.network !== 'custom') {
+      const networkDefaults = NETWORK_CONFIGS[config.network];
+      this.config = {
+        ...networkDefaults,
+        ...config,
+      } as ProtocolConfig;
+    } else {
+      this.config = config;
+    }
+
+    this.server = new SorobanRpc.Server(this.config.rpcUrl);
+    this.governance = new GovernanceClient(this.config, this.server);
+  }
+
+  private config: ProtocolConfig;
+
+  async anchorDID(
+    subjectKeypair: KeypairLike,
+    didDocCid: string,
+    subjectAddress?: string,
+  ): Promise<string> {
+    const publicKey =
+      typeof subjectKeypair.publicKey === "function"
+        ? subjectKeypair.publicKey()
+        : subjectKeypair.publicKey;
+
+    if (subjectAddress && publicKey !== subjectAddress) {
+      throw new Error("subjectKeypair public key does not match subject");
+    }
+
+    const server = this.server;
     const contract = new Contract(this.config.identityOracleId);
 
-    const publicKey = subjectKeypair.publicKey();
-
     const accountData = await server.getAccount(publicKey);
-    const sourceAccount = new Account(publicKey, getSequence(accountData));
+    const sourceAccount = new Account(publicKey, accountData.sequenceNumber());
 
     const tx = new TransactionBuilder(sourceAccount, {
-          fee: this.config.baseFee ?? BASE_FEE,
-          networkPassphrase: this.config.networkPassphrase,
-        })
+      fee: BASE_FEE,
+      networkPassphrase: this.config.networkPassphrase,
+    })
       .addOperation(
         contract.call(
           "anchor_did",
@@ -202,58 +580,64 @@ export class StellarDIDCreditSDK {
       .setTimeout(this.config.timeoutSeconds ?? 30)
       .build();
 
-    const sim = await simulateWithRetry(server, tx, this.config.maxRetries ?? 3);
+    const sim = await server.simulateTransaction(tx);
 
     if (SorobanRpc.Api.isSimulationError(sim)) {
-      throw new Error(`Simulation failed: ${sim.error}`);
+      throwContractError(sim.error, "identity-oracle");
     }
 
     if (!SorobanRpc.Api.isSimulationSuccess(sim)) {
       throw new Error("Simulation returned unexpected response");
     }
 
-    const preparedTx = assembleTransaction(tx, sim).build();
-    preparedTx.sign(subjectKeypair);
+    const preparedTx = SorobanRpc.assembleTransaction(tx, sim).build();
+    preparedTx.sign(subjectKeypair as Keypair);
 
-    const response = await server.sendTransaction(preparedTx);
+    const txHash = await sendTransactionWithRetry(
+      server,
+      preparedTx,
+      this.config.maxRetries,
+      (response) =>
+        new Error(`Transaction submission failed: ${response.errorResult}`),
+    );
 
-    if (response.status !== "PENDING") {
-      throw new Error(`Transaction submission failed: ${String(response.errorResult)}`);
-    }
+    await waitForTransactionConfirmation(
+      server,
+      txHash,
+      "anchorDID",
+      getConfirmationTimeoutMs(this.config),
+      getTransactionPollIntervalMs(this.config),
+    );
 
-    return response.hash;
+    return txHash;
   }
 
-  /**
-   * Issue a verifiable credential by anchoring its hash on-chain.
-   *
-   * Submits a signed transaction to the identity-oracle contract. Requires the issuer
-   * keypair to authorize the operation. The issuer must be registered with the contract.
-   *
-   * @param issuerKeypair - Stellar keypair of the credential issuer
-   * @param subjectAddress - Stellar G... address of the credential subject
-   * @param vcHash - SHA-256 hash of the verifiable credential
-   * @returns Transaction hash on successful submission
-   */
   async issueVC(
-    issuerKeypair: Keypair,
+    issuerKeypair: KeypairLike,
     subjectAddress: string,
     vcHash: Buffer,
   ): Promise<string> {
-    const server = new SorobanRpc.Server(this.config.rpcUrl);
+    if (vcHash.length !== 32) {
+      throw new Error("vcHash must be exactly 32 bytes");
+    }
+
+    const server = this.server;
     const contract = new Contract(this.config.identityOracleId);
 
-    const publicKey = issuerKeypair.publicKey();
+    const publicKey =
+      typeof issuerKeypair.publicKey === "function"
+        ? issuerKeypair.publicKey()
+        : issuerKeypair.publicKey;
 
     const accountData = await server.getAccount(publicKey);
-    const sourceAccount = new Account(publicKey, getSequence(accountData));
+    const sourceAccount = new Account(publicKey, accountData.sequenceNumber());
 
     const hashScVal = nativeToScVal(new Uint8Array(vcHash), { type: "bytes" });
 
     const tx = new TransactionBuilder(sourceAccount, {
-          fee: this.config.baseFee ?? BASE_FEE,
-          networkPassphrase: this.config.networkPassphrase,
-        })
+      fee: BASE_FEE,
+      networkPassphrase: this.config.networkPassphrase,
+    })
       .addOperation(
         contract.call(
           "anchor_vc",
@@ -265,385 +649,430 @@ export class StellarDIDCreditSDK {
       .setTimeout(this.config.timeoutSeconds ?? 30)
       .build();
 
-    const sim = await simulateWithRetry(server, tx, this.config.maxRetries ?? 3);
+    const sim = await server.simulateTransaction(tx);
 
     if (SorobanRpc.Api.isSimulationError(sim)) {
-      throw new Error(`Simulation failed: ${sim.error}`);
+      throwContractError(sim.error, "identity-oracle");
     }
 
     if (!SorobanRpc.Api.isSimulationSuccess(sim)) {
       throw new Error("Simulation returned unexpected response");
     }
 
-    const preparedTx = assembleTransaction(tx, sim).build();
-    preparedTx.sign(issuerKeypair);
+    const preparedTx = SorobanRpc.assembleTransaction(tx, sim).build();
+    preparedTx.sign(issuerKeypair as Keypair);
 
-    const response = await server.sendTransaction(preparedTx);
+    const txHash = await sendTransactionWithRetry(
+      server,
+      preparedTx,
+      this.config.maxRetries,
+      (response) =>
+        new Error(`Transaction submission failed: ${response.errorResult}`),
+    );
 
-    if (response.status !== "PENDING") {
-      throw new Error(`Transaction submission failed: ${String(response.errorResult)}`);
-    }
+    await waitForTransactionConfirmation(
+      server,
+      txHash,
+      "issueVC",
+      getConfirmationTimeoutMs(this.config),
+      getTransactionPollIntervalMs(this.config),
+    );
 
-    return response.hash;
+    return txHash;
   }
 
-  /**
-   * Revoke a verifiable credential on-chain.
-   *
-   * Submits a single signed transaction that calls `revoke` on the revocation-registry
-   * contract and `mark_vc_revoked` on the identity-oracle contract. Requires the issuer
-   * keypair to authorize both operations.
-   *
-   * @param issuerKeypair - Stellar keypair of the credential issuer
-   * @param subjectAddress - Stellar G... address of the credential subject
-   * @param vcHash - SHA-256 hash of the verifiable credential to revoke
-   * @returns Transaction hash on successful submission
-   */
-  async revokeVC(
-    issuerKeypair: Keypair,
-    subjectAddress: string,
-    vcHash: Buffer,
-  ): Promise<string> {
-    if (vcHash.length !== 32) {
-      throw new Error("vcHash must be exactly 32 bytes");
-    }
-
-    const server = new SorobanRpc.Server(this.config.rpcUrl);
-    const revocationContract = new Contract(this.config.revocationRegistryId);
-    const identityContract = new Contract(this.config.identityOracleId);
-
-    const publicKey = issuerKeypair.publicKey();
-
-    const accountData = await server.getAccount(publicKey);
-    const sourceAccount = new Account(publicKey, getSequence(accountData));
-
-    const hashScVal = nativeToScVal(new Uint8Array(vcHash), { type: "bytes" });
-    const issuerScVal = new Address(publicKey).toScVal();
-
-    const tx = new TransactionBuilder(sourceAccount, {
-          fee: this.config.baseFee ?? BASE_FEE,
-          networkPassphrase: this.config.networkPassphrase,
-        })
-      .addOperation(
-        revocationContract.call("revoke", issuerScVal, hashScVal),
-      )
-      .addOperation(
-        identityContract.call(
-          "mark_vc_revoked",
-          issuerScVal,
-          new Address(subjectAddress).toScVal(),
-          hashScVal,
-        ),
-      )
-      .setTimeout(this.config.timeoutSeconds ?? 30)
-      .build();
-
-    const sim = await simulateWithRetry(server, tx, this.config.maxRetries ?? 3);
-
-    if (SorobanRpc.Api.isSimulationError(sim)) {
-      throw new Error(`Simulation failed: ${sim.error}`);
-    }
-
-    if (!SorobanRpc.Api.isSimulationSuccess(sim)) {
-      throw new Error("Simulation returned unexpected response");
-    }
-
-    const preparedTx = assembleTransaction(tx, sim).build();
-    preparedTx.sign(issuerKeypair);
-
-    const response = await server.sendTransaction(preparedTx);
-
-    if (response.status !== "PENDING") {
-      throw new Error(`Transaction submission failed: ${String(response.errorResult)}`);
-    }
-
-    return response.hash;
-  }
-
-  /**
-   * Compute and persist a subject's credit score, then return the stored ScoreRecord.
-   *
-   * Submits a signed transaction to the credit-oracle contract, waits for ledger
-   * confirmation, then fetches the persisted score via `getScore`.
-   *
-   * @param payerKeypair - Stellar keypair paying the transaction fee
-   * @param subjectAddress - Stellar G... address of the subject
-   * @returns Persisted ScoreRecord after the compute_score transaction is confirmed
-   */
   async computeScore(
-    payerKeypair: Keypair,
+    payerKeypair: KeypairLike,
     subjectAddress: string,
-  ): Promise<ScoreRecord> {
-    const server = new SorobanRpc.Server(this.config.rpcUrl);
+  ): Promise<number> {
     const contract = new Contract(this.config.creditOracleId);
 
-    const publicKey = payerKeypair.publicKey();
+    const publicKey = getPublicKey(payerKeypair);
 
-    const accountData = await server.getAccount(publicKey);
-    const sourceAccount = new Account(publicKey, getSequence(accountData));
+    const accountData = await this.server.getAccount(publicKey);
+    const sourceAccount = new Account(publicKey, accountData.sequenceNumber());
 
     const tx = new TransactionBuilder(sourceAccount, {
-          fee: this.config.baseFee ?? BASE_FEE,
-          networkPassphrase: this.config.networkPassphrase,
-        })
+      fee: this.config.baseFee ?? BASE_FEE,
+      networkPassphrase: this.config.networkPassphrase,
+    })
       .addOperation(
         contract.call("compute_score", new Address(subjectAddress).toScVal()),
       )
       .setTimeout(this.config.timeoutSeconds ?? 30)
       .build();
 
-    const sim = await simulateWithRetry(server, tx, this.config.maxRetries ?? 3);
+    const sim = await this.server.simulateTransaction(tx);
 
     if (SorobanRpc.Api.isSimulationError(sim)) {
-      throw new Error(`Simulation failed: ${sim.error}`);
+      if (sim.error && sim.error.toLowerCase().includes("cooldown")) {
+        throw new SDKError(
+          "COOLDOWN_ACTIVE",
+          "Cooldown period is active. Please wait for the cooldown ledgers to pass before recomputing the score.",
+        );
+      }
+      throwContractError(sim.error ?? "Simulation failed", "credit-oracle");
     }
 
     if (!SorobanRpc.Api.isSimulationSuccess(sim)) {
-      throw new Error("Simulation returned unexpected response");
+      throw new SDKError(
+        "TRANSACTION_FAILED",
+        "Simulation returned unexpected response",
+      );
     }
 
-    const preparedTx = assembleTransaction(tx, sim).build();
-    preparedTx.sign(payerKeypair);
+    const preparedTx = SorobanRpc.assembleTransaction(tx, sim).build();
+    preparedTx.sign(payerKeypair as Keypair);
 
-    const response = await server.sendTransaction(preparedTx);
+    const txHash = await sendTransactionWithRetry(
+      this.server,
+      preparedTx,
+      this.config.maxRetries,
+      (submissionResponse) => {
+        if (
+          submissionResponse.errorResult &&
+          String(submissionResponse.errorResult)
+            .toLowerCase()
+            .includes("cooldown")
+        ) {
+          return new SDKError(
+            "COOLDOWN_ACTIVE",
+            "Cooldown period is active. Please wait for the cooldown ledgers to pass before recomputing the score.",
+          );
+        }
+        return new SDKError(
+          "TRANSACTION_FAILED",
+          `Transaction submission failed: ${String(submissionResponse.errorResult)}`,
+        );
+      },
+    );
 
-    if (response.status !== "PENDING") {
-      throw new Error(`Transaction submission failed: ${String(response.errorResult)}`);
+    try {
+      await waitForTransactionConfirmation(
+        this.server,
+        txHash,
+        "computeScore",
+        getConfirmationTimeoutMs(this.config),
+        getTransactionPollIntervalMs(this.config),
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.toLowerCase().includes("cooldown")) {
+        throw new SDKError(
+          "COOLDOWN_ACTIVE",
+          "Cooldown period is active. Please wait for the cooldown ledgers to pass before recomputing the score.",
+        );
+      }
+      throw error;
     }
-
-    await waitForTransactionConfirmation(server, response.hash);
 
     try {
       const score = await this.getScore(subjectAddress);
       if (!score) {
-        throw new Error("Score not computed after compute_score transaction");
+        throw new ScoreNotComputedError(subjectAddress);
       }
-      return score;
+      return score.score;
     } catch (error) {
+      if (error instanceof SDKError) {
+        throw error;
+      }
       const message = error instanceof Error ? error.message : String(error);
-      throw new Error(
+      throw new SDKError(
+        "TRANSACTION_FAILED",
         `computeScore transaction succeeded and was confirmed, but fetching the stored score for ${subjectAddress} failed: ${message}`,
       );
     }
   }
 
-  /**
-   * Fetch the on-chain ScoreRecord for a subject address from the credit-oracle.
-   *
-   * Uses a read-only simulation (no signing required) against the configured RPC endpoint.
-   *
-   * @param subjectAddress - Stellar G... address of the subject
-   * @returns Parsed ScoreRecord, or null if not computed
-   */
   async getScore(subjectAddress: string): Promise<ScoreRecord | null> {
-    const server = new SorobanRpc.Server(this.config.rpcUrl);
+    const server = this.server;
     const contract = new Contract(this.config.creditOracleId);
-
     const sourceAccount = new Account(this.config.simAccount, "0");
-    const tx = new TransactionBuilder(sourceAccount, {
-          fee: this.config.baseFee ?? BASE_FEE,
-          networkPassphrase: this.config.networkPassphrase,
-        })
-      .addOperation(
-        contract.call("get_score", new Address(subjectAddress).toScVal()),
-      )
-      .setTimeout(this.config.timeoutSeconds ?? 30)
-      .build();
 
-    const sim = await simulateWithRetry(server, tx, this.config.maxRetries ?? 3);
+    let attempts = 0;
+    const maxAttempts = (this.config.maxRetries ?? 0) + 1;
 
-    if (SorobanRpc.Api.isSimulationError(sim)) {
-      if (sim.error && sim.error.includes("score not computed")) {
-        throw new ScoreNotComputedError(subjectAddress);
+    while (attempts < maxAttempts) {
+      const tx = new TransactionBuilder(sourceAccount, {
+        fee: this.config.baseFee || BASE_FEE,
+        networkPassphrase: this.config.networkPassphrase,
+      })
+        .addOperation(
+          contract.call("get_score", new Address(subjectAddress).toScVal()),
+        )
+        .setTimeout(this.config.timeoutSeconds ?? 30)
+        .build();
+
+      const sim = await server.simulateTransaction(tx);
+
+      if (SorobanRpc.Api.isSimulationError(sim)) {
+        if (sim.error && sim.error.includes("score not computed")) {
+          return null;
+        }
+        throwContractError(sim.error, "credit-oracle");
       }
-      throw new Error(`Simulation failed: ${sim.error}`);
+
+      if (SorobanRpc.Api.isSimulationSuccess(sim)) {
+        const resultScVal = sim.result?.retval;
+        if (!resultScVal) {
+          throw new Error("No return value in simulation result");
+        }
+        return parseScoreRecord(resultScVal);
+      }
+
+      attempts++;
+      if (attempts < maxAttempts) {
+        await new Promise((resolve) => setTimeout(resolve, 500 * attempts));
+      }
     }
 
-    if (!SorobanRpc.Api.isSimulationSuccess(sim)) {
-      throw new Error("Simulation returned unexpected response");
-    }
-
-    const resultScVal = sim.result?.retval;
-    if (!resultScVal) {
-      throw new Error("No return value in simulation result");
-    }
-
-    return parseScoreRecord(resultScVal);
+    throw new Error("Simulation returned unexpected response");
   }
 
-  /**
-   * Fetch the current scoring weights from the credit-oracle.
-   *
-   * Uses a read-only simulation (no signing required) against the configured RPC endpoint.
-   *
-   * @returns Parsed ScoringWeights
-   */
-  async getWeights(): Promise<ScoringWeights> {
-    const server = new SorobanRpc.Server(this.config.rpcUrl);
-    const contract = new Contract(this.config.creditOracleId);
-
-    const sourceAccount = new Account(this.config.simAccount, "0");
-    const tx = new TransactionBuilder(sourceAccount, {
-          fee: this.config.baseFee ?? BASE_FEE,
-          networkPassphrase: this.config.networkPassphrase,
-        })
-      .addOperation(contract.call("get_scoring_weights"))
-      .setTimeout(this.config.timeoutSeconds ?? 30)
-      .build();
-
-    const sim = await simulateWithRetry(server, tx, this.config.maxRetries ?? 3);
-
-    if (SorobanRpc.Api.isSimulationError(sim)) {
-      throw new Error(`Simulation failed: ${sim.error}`);
-    }
-
-    if (!SorobanRpc.Api.isSimulationSuccess(sim)) {
-      throw new Error("Simulation returned unexpected response");
-    }
-
-    const resultScVal = sim.result?.retval;
-    if (!resultScVal) {
-      throw new Error("No return value in simulation result");
-    }
-
-    return parseScoringWeights(resultScVal);
-  }
-
-  /**
-   * Retrieve the anchored DID document CID for a subject.
-   *
-   * Returns the IPFS CID of the subject's anchored DID document, or `null` if
-   * no DID document has been anchored for this subject. Uses a read-only
-   * simulation — no signing or fees required.
-   *
-   * @param subjectAddress - Stellar address (G...) of the DID subject
-   * @returns IPFS CID string (e.g. "Qm...") if anchored, `null` otherwise
-   */
   async getDIDDocument(subjectAddress: string): Promise<string | null> {
-    const server = new SorobanRpc.Server(this.config.rpcUrl);
+    const server = this.server;
     const contract = new Contract(this.config.identityOracleId);
-
     const sourceAccount = new Account(this.config.simAccount, "0");
 
     const tx = new TransactionBuilder(sourceAccount, {
-          fee: this.config.baseFee ?? BASE_FEE,
-          networkPassphrase: this.config.networkPassphrase,
-        })
+      fee: this.config.baseFee || BASE_FEE,
+      networkPassphrase: this.config.networkPassphrase,
+    })
       .addOperation(
-        contract.call(
-          "get_did_document",
-          new Address(subjectAddress).toScVal(),
-        ),
+        contract.call("get_did_document", new Address(subjectAddress).toScVal()),
       )
       .setTimeout(this.config.timeoutSeconds ?? 30)
       .build();
 
-    const sim = await simulateWithRetry(server, tx, this.config.maxRetries ?? 3);
+    const sim = await server.simulateTransaction(tx);
 
     if (SorobanRpc.Api.isSimulationError(sim)) {
-      throw new Error(`Simulation failed: ${sim.error}`);
+      throwContractError(sim.error, "identity-oracle");
     }
 
     if (!SorobanRpc.Api.isSimulationSuccess(sim)) {
       throw new Error("Simulation returned unexpected response");
     }
 
-    if (!sim.result?.retval) {
+    const resultScVal = sim.result?.retval;
+    if (!resultScVal) {
       throw new Error("No return value in simulation result");
     }
 
-    const native = scValToNative(sim.result.retval);
+    const native = scValToNative(resultScVal);
     if (native === null || native === undefined) {
       return null;
     }
-
     return native as string;
   }
 
-  /**
-   * Verify that a specific VC hash is valid and not revoked for the given subject.
-   *
-   * Uses a read-only simulation against the identity-oracle contract.
-   *
-   * @param subjectAddress - Stellar G... address of the subject
-   * @param vcHash - SHA-256 hash of the credential
-   * @returns true if the credential is valid and not revoked
-   */
-  async verifyVC(subjectAddress: string, vcHash: Buffer): Promise<boolean> {
+  async revokeVC(
+    issuerKeypair: KeypairLike,
+    vcHash: Buffer,
+  ): Promise<string> {
     if (vcHash.length !== 32) {
-      throw new Error("vcHash must be exactly 32 bytes");
+      throw new SDKError(
+        "INVALID_VC_HASH",
+        "vcHash must be exactly 32 bytes",
+      );
     }
 
-    const server = new SorobanRpc.Server(this.config.rpcUrl);
-    const contract = new Contract(this.config.identityOracleId);
+    if (!this.config.revocationRegistryId.trim()) {
+      throw new SDKError(
+        "MISSING_REVOCATION_REGISTRY",
+        "revocationRegistryId is required to revoke a VC",
+      );
+    }
 
-    const sourceAccount = new Account(this.config.simAccount, "0");
+    const server = this.server;
+    const registryContract = new Contract(this.config.revocationRegistryId);
+
+    const publicKey =
+      typeof issuerKeypair.publicKey === "function"
+        ? issuerKeypair.publicKey()
+        : issuerKeypair.publicKey;
+
+    const accountData = await server.getAccount(publicKey);
+    const sourceAccount = new Account(publicKey, accountData.sequenceNumber());
+
     const hashScVal = nativeToScVal(new Uint8Array(vcHash), { type: "bytes" });
 
     const tx = new TransactionBuilder(sourceAccount, {
-          fee: this.config.baseFee ?? BASE_FEE,
-          networkPassphrase: this.config.networkPassphrase,
-        })
+      fee: BASE_FEE,
+      networkPassphrase: this.config.networkPassphrase,
+    })
       .addOperation(
-        contract.call(
-          "verify_vc",
-          new Address(subjectAddress).toScVal(),
+        registryContract.call(
+          "revoke",
+          new Address(publicKey).toScVal(),
           hashScVal,
         ),
       )
       .setTimeout(this.config.timeoutSeconds ?? 30)
       .build();
 
-    const sim = await simulateWithRetry(server, tx, this.config.maxRetries ?? 3);
+    const sim = await server.simulateTransaction(tx);
 
     if (SorobanRpc.Api.isSimulationError(sim)) {
-      throw new Error(`Simulation failed: ${sim.error}`);
+      throwContractError(sim.error, "revocation-registry");
     }
 
     if (!SorobanRpc.Api.isSimulationSuccess(sim)) {
-      throw new Error("Simulation returned unexpected response");
+      throw new SDKError(
+        "TRANSACTION_FAILED",
+        "revokeVC simulation returned an unexpected response; no revocation state was changed",
+      );
     }
 
-    const resultScVal = sim.result?.retval;
-    if (!resultScVal) {
-      throw new Error("No return value in simulation result");
+    const preparedTx = SorobanRpc.assembleTransaction(tx, sim).build();
+    preparedTx.sign(issuerKeypair as Keypair);
+
+    const txHash = await sendTransactionWithRetry(
+      server,
+      preparedTx,
+      this.config.maxRetries,
+      (response) =>
+        createRevokeError(
+          `revokeVC submission failed; no revocation was applied: ${response.errorResult}`,
+          response.errorResult,
+        ),
+    );
+
+    try {
+      await waitForTransactionConfirmation(
+        server,
+        txHash,
+        "revokeVC",
+        getConfirmationTimeoutMs(this.config),
+        getTransactionPollIntervalMs(this.config),
+      );
+    } catch (error) {
+      throw createRevokeError(
+        `revokeVC failed; the atomic transaction rolled back both registry and identity-oracle changes: ${getErrorMessage(error)}`,
+        error,
+      );
     }
 
-    const result = scValToNative(resultScVal);
-    if (typeof result !== "boolean") {
-      throw new Error("verify_vc returned a non-boolean result");
+    return txHash;
+  }
+
+  async batchRevokeVC(
+    issuerKeypair: KeypairLike,
+    vcHashes: Buffer[],
+  ): Promise<BatchResult> {
+    if (!this.config.revocationRegistryId.trim()) {
+      throw new SDKError(
+        "MISSING_REVOCATION_REGISTRY",
+        "revocationRegistryId is required to revoke VCs",
+      );
+    }
+
+    for (const vcHash of vcHashes) {
+      if (vcHash.length !== 32) {
+        throw new SDKError(
+          "INVALID_VC_HASH",
+          "Each vcHash must be exactly 32 bytes",
+        );
+      }
+    }
+
+    if (vcHashes.length === 0) {
+      return {
+        success: true,
+        failedChunks: 0,
+        transactionHashes: [],
+        chunks: [],
+      };
+    }
+
+    let maxBatchSize = 50;
+    try {
+      const limitContract = new Contract(this.config.revocationRegistryId);
+      const limitSource = new Account(this.config.simAccount, "0");
+      const limitTx = new TransactionBuilder(limitSource, {
+        fee: this.config.baseFee ?? BASE_FEE,
+        networkPassphrase: this.config.networkPassphrase,
+      })
+        .addOperation(limitContract.call("get_batch_limit"))
+        .setTimeout(this.config.timeoutSeconds ?? 30)
+        .build();
+      const limitSim = await this.server.simulateTransaction(limitTx);
+      if (
+        SorobanRpc.Api.isSimulationSuccess(limitSim) &&
+        limitSim.result?.retval
+      ) {
+        const parsedLimit = Number(scValToNative(limitSim.result.retval));
+        if (Number.isInteger(parsedLimit) && parsedLimit > 0) {
+          maxBatchSize = parsedLimit;
+        }
+      }
+    } catch {
+      // fall back to 50
+    }
+
+    const result: BatchResult = {
+      success: true,
+      failedChunks: 0,
+      transactionHashes: [],
+      chunks: [],
+    };
+
+    let chunkIndex = 0;
+    for (let i = 0; i < vcHashes.length; i += maxBatchSize) {
+      const chunk = vcHashes.slice(i, i + maxBatchSize);
+      try {
+        const transactionHash = await this.submitBatchRevokeChunk(
+          issuerKeypair,
+          chunk,
+        );
+        result.transactionHashes.push(transactionHash);
+        result.chunks.push({
+          chunkIndex,
+          vcHashes: chunk,
+          status: "fulfilled",
+          transactionHash,
+        });
+      } catch (error) {
+        result.success = false;
+        result.failedChunks += 1;
+        result.chunks.push({
+          chunkIndex,
+          vcHashes: chunk,
+          status: "rejected",
+          error:
+            error instanceof SDKError
+              ? error
+              : createRevokeError(
+                  `batchRevokeVC chunk failed: ${getErrorMessage(error)}`,
+                  error,
+                ),
+        });
+      }
+      chunkIndex += 1;
     }
 
     return result;
   }
 
-  /**
-   * Check if a subject address has at least one non-revoked verifiable credential.
-   *
-   * Uses a read-only simulation against the identity-oracle contract.
-   *
-   * @param subjectAddress - Stellar G... address of the subject
-   * @returns true if subject has ≥ 1 non-revoked credential
-   */
   async isVerified(subjectAddress: string): Promise<boolean> {
-    const server = new SorobanRpc.Server(this.config.rpcUrl);
+    const server = this.server;
     const contract = new Contract(this.config.identityOracleId);
 
     const sourceAccount = new Account(this.config.simAccount, "0");
     const tx = new TransactionBuilder(sourceAccount, {
-          fee: this.config.baseFee ?? BASE_FEE,
-          networkPassphrase: this.config.networkPassphrase,
-        })
+      fee: BASE_FEE,
+      networkPassphrase: this.config.networkPassphrase,
+    })
       .addOperation(
         contract.call("is_verified", new Address(subjectAddress).toScVal()),
       )
-      .setTimeout(this.config.timeoutSeconds ?? 30)
+      .setTimeout(30)
       .build();
 
-    const sim = await simulateWithRetry(server, tx, this.config.maxRetries ?? 3);
+    const sim = await server.simulateTransaction(tx);
 
     if (SorobanRpc.Api.isSimulationError(sim)) {
-      throw new Error(`Simulation failed: ${sim.error}`);
+      throwContractError(sim.error, "identity-oracle");
     }
 
     if (!SorobanRpc.Api.isSimulationSuccess(sim)) {
@@ -658,146 +1087,569 @@ export class StellarDIDCreditSDK {
     return scValToNative(resultScVal) as boolean;
   }
 
-  /**
-   * Get the number of active (non-revoked) verifiable credentials for a subject.
-   *
-   * Uses a read-only simulation against the identity-oracle contract.
-   *
-   * @param subjectAddress - Stellar G... address of the subject
-   * @returns Count of non-revoked anchored VCs
-   */
-  async getVCCount(subjectAddress: string): Promise<number> {
-    const server = new SorobanRpc.Server(this.config.rpcUrl);
-    const contract = new Contract(this.config.identityOracleId);
+  async verifyVC(subjectAddress: string, vcHash: Buffer): Promise<boolean> {
+    if (vcHash.length !== 32) {
+      throw new Error("vcHash must be exactly 32 bytes");
+    }
 
+    const server = this.server;
+    const contract = new Contract(this.config.identityOracleId);
     const sourceAccount = new Account(this.config.simAccount, "0");
+
+    const hashScVal = nativeToScVal(new Uint8Array(vcHash), { type: "bytes" });
+
     const tx = new TransactionBuilder(sourceAccount, {
-          fee: this.config.baseFee ?? BASE_FEE,
-          networkPassphrase: this.config.networkPassphrase,
-        })
+      fee: BASE_FEE,
+      networkPassphrase: this.config.networkPassphrase,
+    })
       .addOperation(
         contract.call(
-          "get_active_vc_count",
+          "verify_vc",
           new Address(subjectAddress).toScVal(),
+          hashScVal,
+        ),
+      )
+      .setTimeout(30)
+      .build();
+
+    const sim = await server.simulateTransaction(tx);
+
+    if (SorobanRpc.Api.isSimulationError(sim)) {
+      if (isVerifyVCNegativeSimulationError(sim.error)) {
+        return false;
+      }
+      throwContractError(sim.error, "identity-oracle");
+    }
+
+    if (!SorobanRpc.Api.isSimulationSuccess(sim)) {
+      throw new Error("Simulation returned unexpected response");
+    }
+
+    const resultScVal = sim.result?.retval;
+    if (!resultScVal) {
+      throw new Error("No return value in simulation result");
+    }
+
+    const native = scValToNative(resultScVal);
+    if (typeof native !== "boolean") {
+      throw new Error("verify_vc returned a non-boolean result");
+    }
+
+    return native;
+  }
+
+  async getVCCount(subjectAddress: string): Promise<number> {
+    const server = this.server;
+    const contract = new Contract(this.config.identityOracleId);
+    const sourceAccount = new Account(this.config.simAccount, "0");
+
+    const tx = new TransactionBuilder(sourceAccount, {
+      fee: BASE_FEE,
+      networkPassphrase: this.config.networkPassphrase,
+    })
+      .addOperation(
+        contract.call("get_active_vc_count", new Address(subjectAddress).toScVal()),
+      )
+      .setTimeout(30)
+      .build();
+
+    const sim = await server.simulateTransaction(tx);
+
+    if (SorobanRpc.Api.isSimulationError(sim)) {
+      throwContractError(sim.error, "identity-oracle");
+    }
+
+    if (!SorobanRpc.Api.isSimulationSuccess(sim)) {
+      throw new Error("Simulation returned unexpected response");
+    }
+
+    const resultScVal = sim.result?.retval;
+    if (!resultScVal) {
+      throw new Error("No return value in simulation result");
+    }
+
+    return scValToNative(resultScVal) as number;
+  }
+
+  async getVCs(subjectAddress: string): Promise<VCRecord[]> {
+    const server = this.server;
+    const contract = new Contract(this.config.identityOracleId);
+    const sourceAccount = new Account(this.config.simAccount, "0");
+
+    const tx = new TransactionBuilder(sourceAccount, {
+      fee: BASE_FEE,
+      networkPassphrase: this.config.networkPassphrase,
+    })
+      .addOperation(
+        contract.call("get_vc_details", new Address(subjectAddress).toScVal()),
+      )
+      .setTimeout(30)
+      .build();
+
+    const sim = await server.simulateTransaction(tx);
+
+    if (SorobanRpc.Api.isSimulationError(sim)) {
+      throwContractError(sim.error, "identity-oracle");
+    }
+
+    if (!SorobanRpc.Api.isSimulationSuccess(sim)) {
+      throw new Error("Simulation returned unexpected response");
+    }
+
+    const resultScVal = sim.result?.retval;
+    if (!resultScVal) {
+      throw new Error("No return value in simulation result");
+    }
+
+    return parseVCRecordList(resultScVal);
+  }
+
+  async getCredentialType(
+    subjectAddress: string,
+    vcHash: Buffer,
+  ): Promise<string> {
+    if (vcHash.length !== 32) {
+      throw new Error("vcHash must be exactly 32 bytes");
+    }
+
+    const server = this.server;
+    const contract = new Contract(this.config.identityOracleId);
+    const sourceAccount = new Account(this.config.simAccount, "0");
+
+    const hashScVal = nativeToScVal(new Uint8Array(vcHash), { type: "bytes" });
+
+    const tx = new TransactionBuilder(sourceAccount, {
+      fee: BASE_FEE,
+      networkPassphrase: this.config.networkPassphrase,
+    })
+      .addOperation(
+        contract.call(
+          "get_vc_credential_type",
+          new Address(subjectAddress).toScVal(),
+          hashScVal,
+        ),
+      )
+      .setTimeout(30)
+      .build();
+
+    const sim = await server.simulateTransaction(tx);
+
+    if (SorobanRpc.Api.isSimulationError(sim)) {
+      throwContractError(sim.error, "identity-oracle");
+    }
+
+    if (!SorobanRpc.Api.isSimulationSuccess(sim)) {
+      throw new Error("Simulation returned unexpected response");
+    }
+
+    const resultScVal = sim.result?.retval;
+    if (!resultScVal) {
+      throw new Error("No return value in simulation result");
+    }
+
+    return String(scValToNative(resultScVal));
+  }
+
+  async getWeights(): Promise<ScoringWeights> {
+    const server = this.server;
+    const contract = new Contract(this.config.creditOracleId);
+    const sourceAccount = new Account(this.config.simAccount, "0");
+
+    const tx = new TransactionBuilder(sourceAccount, {
+      fee: BASE_FEE,
+      networkPassphrase: this.config.networkPassphrase,
+    })
+      .addOperation(contract.call("get_scoring_weights"))
+      .setTimeout(30)
+      .build();
+
+    const sim = await server.simulateTransaction(tx);
+
+    if (SorobanRpc.Api.isSimulationError(sim)) {
+      throwContractError(sim.error, "credit-oracle");
+    }
+
+    if (!SorobanRpc.Api.isSimulationSuccess(sim)) {
+      throw new Error("Simulation returned unexpected response");
+    }
+
+    const resultScVal = sim.result?.retval;
+    if (!resultScVal) {
+      throw new Error("No return value in simulation result");
+    }
+
+    return parseScoringWeights(resultScVal);
+  }
+
+  async getRegisteredIssuers(): Promise<string[]> {
+    const server = this.server;
+    const contract = new Contract(this.config.identityOracleId);
+    const sourceAccount = new Account(this.config.simAccount, "0");
+
+    const tx = new TransactionBuilder(sourceAccount, {
+      fee: BASE_FEE,
+      networkPassphrase: this.config.networkPassphrase,
+    })
+      .addOperation(contract.call("list_issuers"))
+      .setTimeout(30)
+      .build();
+
+    const sim = await server.simulateTransaction(tx);
+
+    if (SorobanRpc.Api.isSimulationError(sim)) {
+      throwContractError(sim.error, "identity-oracle");
+    }
+
+    if (!SorobanRpc.Api.isSimulationSuccess(sim)) {
+      throw new Error("Simulation returned unexpected response");
+    }
+
+    const resultScVal = sim.result?.retval;
+    if (!resultScVal) {
+      throw new Error("No return value in simulation result");
+    }
+
+    const native = scValToNative(resultScVal);
+    return (native as unknown[]).map((addr) => String(addr));
+  }
+
+  async listProposals(
+    fromId: number | bigint,
+    limit: number,
+    includeInactive = false,
+  ): Promise<GovernanceProposal[]> {
+    if (!this.config.governanceId) {
+      throw new Error("governanceId is not configured in ProtocolConfig");
+    }
+
+    const server = this.server;
+    const contract = new Contract(this.config.governanceId);
+    const sourceAccount = new Account(this.config.simAccount, "0");
+
+    const tx = new TransactionBuilder(sourceAccount, {
+      fee: BASE_FEE,
+      networkPassphrase: this.config.networkPassphrase,
+    })
+      .addOperation(
+        contract.call(
+          "list_proposals",
+          nativeToScVal(BigInt(fromId), { type: "u64" }),
+          nativeToScVal(limit, { type: "u32" }),
+          nativeToScVal(includeInactive, { type: "bool" }),
+        ),
+      )
+      .setTimeout(30)
+      .build();
+
+    const sim = await server.simulateTransaction(tx);
+
+    if (SorobanRpc.Api.isSimulationError(sim)) {
+      throwContractError(sim.error, "governance");
+    }
+
+    if (!SorobanRpc.Api.isSimulationSuccess(sim)) {
+      throw new Error("Simulation returned unexpected response");
+    }
+
+    const resultScVal = sim.result?.retval;
+    if (!resultScVal) {
+      throw new Error("No return value in simulation result");
+    }
+
+    return parseGovernanceProposalList(resultScVal);
+  }
+
+  onVCAnchored(
+    contractId: string,
+    callback: (issuer: string, subject: string, vcHash: Buffer) => void,
+  ): Unsubscribe {
+    return this.subscribeToEvents(
+      contractId,
+      "VCAnch",
+      (value) => {
+        const [issuer, subject, vcHash] = parseEventTuple(
+          value,
+          "VCAnch",
+          3,
+        );
+        callback(String(issuer), String(subject), toBuffer(vcHash));
+      },
+    );
+  }
+
+  onScoreComputed(
+    contractId: string,
+    callback: (subject: string, score: number) => void,
+  ): Unsubscribe {
+    return this.subscribeToEvents(
+      contractId,
+      "Score",
+      (value) => {
+        const [subject, score] = parseEventTuple(value, "Score", 2);
+        callback(String(subject), Number(score));
+      },
+    );
+  }
+
+  onVCRevoked(
+    contractId: string,
+    callback: (issuer: string, vcHash: Buffer) => void,
+  ): Unsubscribe {
+    return this.subscribeToEvents(
+      contractId,
+      "Revoked",
+      (value) => {
+        const [issuer, vcHash] = parseEventTuple(value, "Revoked", 2);
+        callback(String(issuer), toBuffer(vcHash));
+      },
+    );
+  }
+
+  private async submitBatchRevokeChunk(
+    issuerKeypair: KeypairLike,
+    vcHashes: Buffer[],
+  ): Promise<string> {
+    const server = this.server;
+    const registryContract = new Contract(this.config.revocationRegistryId);
+    const publicKey = getPublicKey(issuerKeypair);
+
+    const accountData = await server.getAccount(publicKey);
+    const sourceAccount = new Account(publicKey, accountData.sequenceNumber());
+
+    const tx = new TransactionBuilder(sourceAccount, {
+      fee: this.config.baseFee ?? BASE_FEE,
+      networkPassphrase: this.config.networkPassphrase,
+    })
+      .addOperation(
+        registryContract.call(
+          "batch_revoke",
+          new Address(publicKey).toScVal(),
+          xdr.ScVal.scvVec(
+            vcHashes.map((vcHash) =>
+              nativeToScVal(new Uint8Array(vcHash), { type: "bytes" }),
+            ),
+          ),
         ),
       )
       .setTimeout(this.config.timeoutSeconds ?? 30)
       .build();
 
-    const sim = await simulateWithRetry(server, tx, this.config.maxRetries ?? 3);
+    const sim = await server.simulateTransaction(tx);
 
     if (SorobanRpc.Api.isSimulationError(sim)) {
-      throw new Error(`Simulation failed: ${sim.error}`);
+      throwContractError(sim.error, "revocation-registry");
     }
 
     if (!SorobanRpc.Api.isSimulationSuccess(sim)) {
-      throw new Error("Simulation returned unexpected response");
+      throw new SDKError(
+        "TRANSACTION_FAILED",
+        "batchRevokeVC simulation returned an unexpected response",
+      );
     }
 
-    const resultScVal = sim.result?.retval;
-    if (!resultScVal) {
-      throw new Error("No return value in simulation result");
+    const preparedTx = SorobanRpc.assembleTransaction(tx, sim).build();
+    preparedTx.sign(issuerKeypair as Keypair);
+
+    const txHash = await sendTransactionWithRetry(
+      server,
+      preparedTx,
+      this.config.maxRetries,
+      (response) =>
+        createRevokeError(
+          `batchRevokeVC submission failed: ${response.errorResult}`,
+          response.errorResult,
+        ),
+    );
+
+    try {
+      await waitForTransactionConfirmation(
+        server,
+        txHash,
+        "batchRevokeVC",
+        getConfirmationTimeoutMs(this.config),
+        getTransactionPollIntervalMs(this.config),
+      );
+    } catch (error) {
+      throw createRevokeError(
+        `batchRevokeVC failed; this chunk rolled back: ${getErrorMessage(error)}`,
+        error,
+      );
     }
 
-    return Number(scValToNative(resultScVal));
+    return txHash;
   }
 
-  /**
-   * Fetch the currently registered trusted issuers from the identity-oracle.
-   *
-   * Uses a read-only simulation against the identity-oracle contract.
-   *
-   * @returns Stellar G... addresses of registered issuers
-   */
-  async getRegisteredIssuers(): Promise<string[]> {
-    const server = new SorobanRpc.Server(this.config.rpcUrl);
-    const contract = new Contract(this.config.identityOracleId);
-
-    const sourceAccount = new Account(this.config.simAccount, "0");
-    const tx = new TransactionBuilder(sourceAccount, {
-          fee: this.config.baseFee ?? BASE_FEE,
-          networkPassphrase: this.config.networkPassphrase,
-        })
-      .addOperation(contract.call("list_issuers"))
-      .setTimeout(this.config.timeoutSeconds ?? 30)
-      .build();
-
-    const sim = await simulateWithRetry(server, tx, this.config.maxRetries ?? 3);
-
-    if (SorobanRpc.Api.isSimulationError(sim)) {
-      throw new Error(`Simulation failed: ${sim.error}`);
+  private subscribeToEvents(
+    contractId: string,
+    eventName: string,
+    handleValue: (value: xdr.ScVal) => void,
+  ): Unsubscribe {
+    const pollIntervalMs = this.config.pollIntervalMs ?? 1000;
+    if (!Number.isFinite(pollIntervalMs) || pollIntervalMs <= 0) {
+      throw new Error("pollIntervalMs must be a positive number");
     }
 
-    if (!SorobanRpc.Api.isSimulationSuccess(sim)) {
-      throw new Error("Simulation returned unexpected response");
-    }
+    let active = true;
+    let polling = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let lastSeenLedger: number | undefined;
 
-    const resultScVal = sim.result?.retval;
-    if (!resultScVal) {
-      throw new Error("No return value in simulation result");
-    }
+    const poll = async (): Promise<void> => {
+      if (!active || polling) {
+        return;
+      }
 
-    const issuers = scValToNative(resultScVal);
-    if (!Array.isArray(issuers)) {
-      throw new Error("list_issuers returned a non-array result");
-    }
+      polling = true;
+      try {
+        if (lastSeenLedger === undefined) {
+          const latestLedger = await this.server.getLatestLedger();
+          lastSeenLedger = latestLedger.sequence;
+        }
 
-    return issuers.map((issuer) => String(issuer));
+        if (!active) {
+          return;
+        }
+
+        const response = await this.server.getEvents({
+          startLedger: lastSeenLedger,
+          filters: [
+            {
+              type: "contract",
+              contractIds: [contractId],
+              topics: [[xdr.ScVal.scvSymbol(eventName).toXDR("base64")]],
+            },
+          ],
+          limit: 100,
+        });
+
+        const latestEventLedger = response.events.reduce(
+          (highestLedger, event) => Math.max(highestLedger, event.ledger),
+          lastSeenLedger,
+        );
+        lastSeenLedger =
+          Math.max(response.latestLedger, latestEventLedger) + 1;
+
+        for (const event of response.events) {
+          if (!active) {
+            break;
+          }
+          handleValue(event.value);
+        }
+      } catch {
+        // Keep polling after transient RPC failures.
+      } finally {
+        polling = false;
+        if (active) {
+          timer = setTimeout(() => void poll(), pollIntervalMs);
+        }
+      }
+    };
+
+    void poll();
+
+    return () => {
+      active = false;
+      if (timer !== undefined) {
+        clearTimeout(timer);
+        timer = undefined;
+      }
+    };
   }
 }
 
 /** Thrown when get_score is called for an address that has no computed score yet. */
 export class ScoreNotComputedError extends Error {
   constructor(address?: string) {
-    super(
-      address
-        ? `No score computed for address: ${address}`
-        : "Score has not been computed",
-    );
+    super(address ? `No score computed for address: ${address}` : "Score has not been computed");
     this.name = "ScoreNotComputedError";
   }
 }
 
+function getPublicKey(keypair: KeypairLike): string {
+  return typeof keypair.publicKey === "function"
+    ? keypair.publicKey()
+    : keypair.publicKey;
+}
+
+function toUnsignedBigInt(value: GovernanceInteger): bigint {
+  assertSafeInteger(value);
+  const result = BigInt(value);
+  if (result < 0n) {
+    throw new Error("integer values must be non-negative");
+  }
+  return result;
+}
+
+function toPositiveBigInt(value: GovernanceInteger): bigint {
+  assertSafeInteger(value);
+  const result = BigInt(value);
+  if (result <= 0n) {
+    throw new Error("voteWeight must be positive");
+  }
+  return result;
+}
+
+function assertSafeInteger(value: GovernanceInteger): void {
+  if (typeof value === "number" && !Number.isSafeInteger(value)) {
+    throw new Error("number values must be safe integers; use bigint instead");
+  }
+}
+
+function scoringWeightsToScVal(weights: ScoringWeights): xdr.ScVal {
+  return nativeToScVal(
+    {
+      vc_weight: weights.vcWeight,
+      tx_weight: weights.txWeight,
+      repayment_weight: weights.repaymentWeight,
+    },
+    {
+      type: {
+        vc_weight: ["symbol", "u32"],
+        tx_weight: ["symbol", "u32"],
+        repayment_weight: ["symbol", "u32"],
+      },
+    },
+  );
+}
+
 /**
  * Parse a Soroban ScVal representing an Option<ScoreRecord>.
- * Returns the ScoreRecord if Some, throws ScoreNotComputedError if None.
+ * Returns the ScoreRecord if Some, returns null if None.
  * Throws an Error if any required field is missing after scValToNative.
  */
-export function parseScoreRecord(
-  scVal: xdr.ScVal,
-): ScoreRecord | null {
-  if (!scVal || (typeof scVal.switch === "function" && scVal.switch() === xdr.ScValType.scvVoid())) {
-    return null;
-  }
+export function parseScoreRecord(scVal: xdr.ScVal): ScoreRecord | null {
   const native = scValToNative(scVal);
   if (native === null || native === undefined) {
     return null;
   }
   const raw = native as Record<string, unknown>;
-  
-  // Field presence validation — contract schema changes must be loud, not silent.
+
   const requiredFields = [
     'score',
     'last_updated',
     'vc_count',
     'repayment_rate',
     'tx_volume_30d',
+    'previous_score',
+    'computed_at_ledger',
+    'stale',
   ] as const;
-  
+
   for (const field of requiredFields) {
     if (!(field in raw)) {
-      throw new Error(
-        `parseScoreRecord: missing field '${field}' in ScoreRecord`,
-      );
+      throw new Error(`parseScoreRecord: missing field '${field}' in ScoreRecord`);
     }
   }
-  
+
   return {
     score: Number(raw["score"]),
     lastUpdated: Number(raw["last_updated"]),
     vcCount: Number(raw["vc_count"]),
     repaymentRate: Number(raw["repayment_rate"]),
     txVolume30d: BigInt(raw["tx_volume_30d"] as bigint),
+    previousScore: raw["previous_score"] != null ? Number(raw["previous_score"]) : null,
+    computedAtLedger: Number(raw["computed_at_ledger"]),
+    stale: Boolean(raw["stale"]),
   };
 }
 
@@ -815,38 +1667,415 @@ function parseScoringWeights(scVal: xdr.ScVal): ScoringWeights {
   };
 }
 
+function parseGovernanceProposal(native: unknown): GovernanceProposal {
+  if (typeof native !== "object" || native === null) {
+    throw new Error("get_proposal returned an invalid result");
+  }
+
+  const raw = native as Record<string, unknown>;
+  const weights = raw["proposed_weights"];
+  if (typeof weights !== "object" || weights === null) {
+    throw new Error("get_proposal returned invalid proposed weights");
+  }
+
+  const rawWeights = weights as Record<string, unknown>;
+  return {
+    id: BigInt(raw["id"] as bigint | number | string),
+    proposer: String(raw["proposer"]),
+    proposedWeights: {
+      vcWeight: Number(rawWeights["vc_weight"]),
+      txWeight: Number(rawWeights["tx_weight"]),
+      repaymentWeight: Number(rawWeights["repayment_weight"]),
+    },
+    votesFor: BigInt(raw["votes_for"] as bigint | number | string),
+    votesAgainst: BigInt(
+      raw["votes_against"] as bigint | number | string,
+    ),
+    expiryLedger: Number(raw["expiry_ledger"]),
+    executionDelayLedgers: Number(raw["execution_delay_ledgers"]),
+    executed: Boolean(raw["executed"]),
+    cancelled: Boolean(raw["cancelled"]),
+    quorumRequired: BigInt(
+      raw["quorum_required"] as bigint | number | string,
+    ),
+  };
+}
+
+function parseVCRecordList(scVal: xdr.ScVal): VCRecord[] {
+  const native = scValToNative(scVal);
+  if (native === null || native === undefined) {
+    return [];
+  }
+  return (native as unknown[]).map((entry) => {
+    const raw = entry as Record<string, unknown>;
+    const vcHash = raw["vc_hash"] as Buffer | Uint8Array | undefined;
+    return {
+      vcHash: Buffer.isBuffer(vcHash)
+        ? vcHash
+        : Buffer.from(vcHash ?? new Uint8Array()),
+      issuer: String(raw["issuer"]),
+      anchoredAt: Number(raw["anchored_at"]),
+      revoked: Boolean(raw["revoked"]),
+    };
+  });
+}
+
+function parseGovernanceProposalList(scVal: xdr.ScVal): GovernanceProposal[] {
+  const native = scValToNative(scVal);
+  if (native === null || native === undefined) {
+    return [];
+  }
+  return (native as unknown[]).map((entry) => {
+    const raw = entry as Record<string, unknown>;
+    const weights = raw["proposed_weights"] as Record<string, unknown>;
+    return {
+      id: BigInt(raw["id"] as bigint | number | string),
+      proposer: String(raw["proposer"]),
+      proposedWeights: {
+        vcWeight: Number(weights["vc_weight"]),
+        txWeight: Number(weights["tx_weight"]),
+        repaymentWeight: Number(weights["repayment_weight"]),
+      },
+      votesFor: BigInt(raw["votes_for"] as bigint | number | string),
+      votesAgainst: BigInt(raw["votes_against"] as bigint | number | string),
+      expiryLedger: Number(raw["expiry_ledger"]),
+      executionDelayLedgers: Number(raw["execution_delay_ledgers"]),
+      executed: Boolean(raw["executed"]),
+      cancelled: Boolean(raw["cancelled"]),
+      quorumRequired: BigInt(raw["quorum_required"] as bigint | number | string),
+    };
+  });
+}
+
+type SendTransactionErrorFactory = (
+  response: SorobanRpc.Api.SendTransactionResponse,
+) => Error;
+
+async function sendTransactionWithRetry(
+  server: SorobanRpc.Server,
+  transaction: Parameters<SorobanRpc.Server["sendTransaction"]>[0],
+  maxRetries = 3,
+  errorFactory: SendTransactionErrorFactory,
+): Promise<string> {
+  const retries = normalizeMaxRetries(maxRetries);
+
+  for (let attempt = 0; ; attempt++) {
+    let response: SorobanRpc.Api.SendTransactionResponse;
+    try {
+      response = await server.sendTransaction(transaction);
+    } catch (error) {
+      if (!isRetryableError(error) || attempt >= retries) {
+        throw error;
+      }
+
+      await sleep(getRetryDelayMs(attempt));
+      continue;
+    }
+
+    if (response.status === "PENDING" || response.status === "DUPLICATE") {
+      return response.hash;
+    }
+
+    if (response.status !== "TRY_AGAIN_LATER" || attempt >= retries) {
+      throw errorFactory(response);
+    }
+
+    await sleep(getRetryDelayMs(attempt));
+  }
+}
+
+function parseEventTuple(
+  scVal: xdr.ScVal,
+  eventName: string,
+  expectedLength: number,
+): unknown[] {
+  const native = scValToNative(scVal);
+  if (!Array.isArray(native) || native.length !== expectedLength) {
+    throw new Error(
+      `${eventName} event data must be a tuple with ${expectedLength} values`,
+    );
+  }
+  return native;
+}
+
+function toBuffer(value: unknown): Buffer {
+  if (Buffer.isBuffer(value)) {
+    return value;
+  }
+  if (value instanceof Uint8Array) {
+    return Buffer.from(value);
+  }
+  throw new Error("event data contains an invalid byte value");
+}
+
 async function waitForTransactionConfirmation(
   server: SorobanRpc.Server,
   txHash: string,
-  attempts = 20,
+  operationName: string,
+  timeoutMs = 20_000,
   delayMs = 1000,
 ): Promise<void> {
-  for (let attempt = 0; attempt < attempts; attempt++) {
-    const result = await server.getTransaction(txHash);
+  const normalizedTimeoutMs = Number.isFinite(timeoutMs)
+    ? Math.max(0, timeoutMs)
+    : 30_000;
+  const pollDelayMs = Number.isFinite(delayMs) ? Math.max(1, delayMs) : 1000;
+  const deadline = Date.now() + normalizedTimeoutMs;
 
-    switch (result.status) {
+  for (;;) {
+    if (Date.now() >= deadline) {
+      throwTransactionTimeout(operationName, txHash);
+    }
+
+    let result: Awaited<ReturnType<SorobanRpc.Server["getTransaction"]>>;
+    try {
+      result = await withTimeout(
+        server.getTransaction(txHash),
+        deadline - Date.now(),
+        () => createTransactionTimeoutError(operationName, txHash),
+      );
+    } catch (error) {
+      if (error instanceof SDKError) {
+        throw error;
+      }
+      if (!isRetryableError(error)) {
+        throw error;
+      }
+      if (Date.now() >= deadline) {
+        throwTransactionTimeout(operationName, txHash);
+      }
+      await sleep(Math.min(pollDelayMs, deadline - Date.now()));
+      continue;
+    }
+
+    switch (result.status as string) {
       case "SUCCESS":
         return;
       case "FAILED": {
-        const errorDetails = JSON.stringify(result);
-        throw new Error(
-          `computeScore transaction failed for ${txHash}: ${errorDetails}`,
+        const resultXdr = extractResultXdr(result);
+        throw new SDKError(
+          "TRANSACTION_FAILED",
+          `${operationName} transaction failed for ${txHash}; resultXdr: ${resultXdr ?? "unknown"}`,
+          {
+            cause: result,
+            transactionHash: txHash,
+            resultXdr,
+          },
         );
       }
       case "NOT_FOUND":
       case "PENDING":
-        await sleep(delayMs);
+        if (Date.now() >= deadline) {
+          throwTransactionTimeout(operationName, txHash);
+        }
+        await sleep(Math.min(pollDelayMs, deadline - Date.now()));
         break;
       default:
         throw new Error(
-          `Unexpected transaction status for ${txHash}: ${String((result as unknown as { status: string }).status)}`,
+          `Unexpected transaction status for ${txHash}: ${String(result.status)}`,
         );
     }
   }
+}
 
-  throw new Error(
-    `Timed out waiting for computeScore transaction confirmation: ${txHash}`,
+function createTransactionTimeoutError(
+  operationName: string,
+  txHash: string,
+): SDKError {
+  return new SDKError(
+    "TRANSACTION_TIMEOUT",
+    `Timed out waiting for ${operationName} transaction confirmation: ${txHash}`,
   );
+}
+
+function throwTransactionTimeout(operationName: string, txHash: string): never {
+  throw createTransactionTimeoutError(operationName, txHash);
+}
+
+function getConfirmationTimeoutMs(config: ProtocolConfig): number {
+  return (
+    config.confirmationTimeoutMs ??
+    (config.timeoutSeconds ?? 30) * 1000
+  );
+}
+
+function getTransactionPollIntervalMs(config: ProtocolConfig): number {
+  const configured = config.pollIntervalMs;
+  if (!Number.isFinite(configured) || configured === undefined) {
+    return 5000;
+  }
+  return Math.max(1, configured);
+}
+
+function extractResultXdr(value: unknown): string | undefined {
+  if (typeof value !== "object" || value === null) {
+    return undefined;
+  }
+
+  const candidate = value as Record<string, unknown>;
+  const raw =
+    candidate["resultXdr"] ??
+    candidate["result_xdr"] ??
+    candidate["errorResultXdr"] ??
+    candidate["error_result_xdr"];
+  return raw === undefined || raw === null ? undefined : String(raw);
+}
+
+function normalizeMaxRetries(maxRetries: number): number {
+  return Number.isFinite(maxRetries) ? Math.max(0, Math.floor(maxRetries)) : 3;
+}
+
+function getRetryDelayMs(attempt: number): number {
+  return 1000 * 2 ** attempt;
+}
+
+function isRetryableError(error: unknown): boolean {
+  const candidate = error as {
+    code?: unknown;
+    status?: unknown;
+    statusCode?: unknown;
+    response?: { status?: unknown; statusCode?: unknown };
+  } | null;
+
+  const httpStatus = [
+    candidate?.status,
+    candidate?.statusCode,
+    candidate?.response?.status,
+    candidate?.response?.statusCode,
+  ]
+    .map((status) => Number(status))
+    .find((status) => Number.isInteger(status) && status > 0);
+  if (httpStatus !== undefined) {
+    return [408, 429, 500, 502, 503, 504].includes(httpStatus);
+  }
+
+  const code = String(candidate?.code ?? "").toUpperCase();
+  if (
+    ["ECONNRESET", "ECONNREFUSED", "ENETUNREACH", "ETIMEDOUT", "EAI_AGAIN"].includes(
+      code,
+    )
+  ) {
+    return true;
+  }
+
+  const message =
+    error instanceof Error
+      ? error.message.toLowerCase()
+      : String(error).toLowerCase();
+  return /\b503\b|timeout|timed out|network|fetch failed|unavailable|socket/.test(message);
+}
+
+function createRevokeError(message: string, details: unknown): SDKError {
+  if (containsIssuerMismatch(details)) {
+    return new SDKError(
+      "NOT_REGISTERED_ISSUER",
+      "The issuer is not registered for this VC hash",
+      { cause: details },
+    );
+  }
+
+  if (
+    details instanceof SDKError &&
+    details.code === "TRANSACTION_TIMEOUT"
+  ) {
+    return new SDKError("TRANSACTION_TIMEOUT", message, {
+      cause: details,
+      transactionHash: details.transactionHash,
+      resultXdr: details.resultXdr,
+    });
+  }
+
+  if (
+    details instanceof SDKError &&
+    details.code === "TRANSACTION_FAILED"
+  ) {
+    if (containsIssuerMismatch(details.cause)) {
+      return new SDKError(
+        "NOT_REGISTERED_ISSUER",
+        "The issuer is not registered for this VC hash",
+        {
+          cause: details,
+          transactionHash: details.transactionHash,
+          resultXdr: details.resultXdr,
+        },
+      );
+    }
+
+    return new SDKError("TRANSACTION_FAILED", message, {
+      cause: details,
+      transactionHash: details.transactionHash,
+      resultXdr: details.resultXdr,
+    });
+  }
+
+  return new SDKError("TRANSACTION_FAILED", message, { cause: details });
+}
+
+function containsIssuerMismatch(value: unknown): boolean {
+  if (value instanceof RevocationRegistryError && value.code === 3) {
+    return true;
+  }
+  if (value instanceof IdentityOracleError && value.code === 3) {
+    return true;
+  }
+  const text = getErrorMessage(value).toLowerCase();
+  return (
+    text.includes("issuermismatch") ||
+    text.includes("issuer mismatch") ||
+    /error\(contract,\s*#3\)/i.test(text)
+  );
+}
+
+function getErrorMessage(value: unknown): string {
+  if (value instanceof Error) {
+    return value.message;
+  }
+  if (typeof value === "string") {
+    return value;
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function isVerifyVCNegativeSimulationError(error: unknown): boolean {
+  if (error instanceof IdentityOracleError) {
+    return error.code === 7 || error.code === 8;
+  }
+  const text = getErrorMessage(error).toLowerCase();
+  return (
+    text.includes("contractpaused") ||
+    text.includes("contract paused") ||
+    /error\(contract,\s*#8\)/i.test(text) ||
+    text.includes("vcnotfound") ||
+    text.includes("unknown subject") ||
+    text.includes("not found")
+  );
+}
+
+function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  createError: () => Error,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(createError()),
+      Math.max(0, timeoutMs),
+    );
+
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
 }
 
 function sleep(ms: number): Promise<void> {
