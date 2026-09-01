@@ -718,3 +718,41 @@ describe("test_all_exports_are_defined", () => {
     expect(_config).toBeDefined();
   });
 });
+
+describe("parseScoreRecord", () => {
+  it("test_parseScoreRecord_valid", () => {
+    const scoreRecord = {
+      score: 750,
+      last_updated: 1234567890,
+      vc_count: 5,
+      repayment_rate: 9500,
+      tx_volume_30d: 1000000,
+    };
+
+    const scVal = { value: scoreRecord } as never;
+    const result = parseScoreRecord(scVal);
+
+    expect(result).not.toBeNull();
+    expect(result!.score).toBe(750);
+    expect(result!.lastUpdated).toBe(1234567890);
+    expect(result!.vcCount).toBe(5);
+    expect(result!.repaymentRate).toBe(9500);
+    expect(result!.txVolume30d).toBe(BigInt(1000000));
+  });
+
+  it("test_parseScoreRecord_throws_on_missing_field", () => {
+    const scoreRecord = {
+      score: 750,
+      last_updated: 1234567890,
+      vc_count: 5,
+      repayment_rate: 9500,
+      // tx_volume_30d intentionally missing
+    };
+
+    const scVal = { value: scoreRecord } as never;
+
+    expect(() => parseScoreRecord(scVal)).toThrow(
+      "parseScoreRecord: missing field 'tx_volume_30d' in ScoreRecord",
+    );
+  });
+});

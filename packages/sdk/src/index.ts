@@ -761,8 +761,9 @@ export class ScoreNotComputedError extends Error {
 /**
  * Parse a Soroban ScVal representing an Option<ScoreRecord>.
  * Returns the ScoreRecord if Some, throws ScoreNotComputedError if None.
+ * Throws an Error if any required field is missing after scValToNative.
  */
-function parseScoreRecord(
+export function parseScoreRecord(
   scVal: xdr.ScVal,
 ): ScoreRecord | null {
   if (!scVal || (typeof scVal.switch === "function" && scVal.switch() === xdr.ScValType.scvVoid())) {
@@ -773,6 +774,24 @@ function parseScoreRecord(
     return null;
   }
   const raw = native as Record<string, unknown>;
+  
+  // Field presence validation — contract schema changes must be loud, not silent.
+  const requiredFields = [
+    'score',
+    'last_updated',
+    'vc_count',
+    'repayment_rate',
+    'tx_volume_30d',
+  ] as const;
+  
+  for (const field of requiredFields) {
+    if (!(field in raw)) {
+      throw new Error(
+        `parseScoreRecord: missing field '${field}' in ScoreRecord`,
+      );
+    }
+  }
+  
   return {
     score: Number(raw["score"]),
     lastUpdated: Number(raw["last_updated"]),
