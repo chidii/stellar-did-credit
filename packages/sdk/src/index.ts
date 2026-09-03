@@ -1902,6 +1902,20 @@ export function parseScoreRecord(scVal: xdr.ScVal): ScoreRecord | null {
     return null;
   }
   const raw = native as Record<string, unknown>;
+  const requiredFields = [
+    "score",
+    "last_updated",
+    "vc_count",
+    "repayment_rate",
+    "tx_volume_30d",
+    "computed_at_ledger",
+    "stale",
+  ];
+  for (const field of requiredFields) {
+    if (!(field in raw)) {
+      throw new Error(`parseScoreRecord: missing field '${field}' in ScoreRecord`);
+    }
+  }
   return {
     score: Number(raw["score"]),
     lastUpdated: Number(raw["last_updated"]),
