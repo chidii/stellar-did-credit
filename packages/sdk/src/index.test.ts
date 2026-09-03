@@ -11,6 +11,7 @@ import {
   parseContractErrorCode,
   MIN_SCORE,
   MAX_SCORE,
+  parseScoreRecord,
   ScoreRecord,
   ProtocolConfig,
   TxStats,
