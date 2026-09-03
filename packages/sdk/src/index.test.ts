@@ -56,6 +56,7 @@ jest.mock("@stellar/stellar-sdk", () => ({
       scvSymbol: (symbol: string) => ({
         toXDR: () => `symbol:${symbol}`,
       }),
+      scvVec: (elements: unknown[]) => elements,
     },
   },
   Keypair: {},
