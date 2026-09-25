@@ -350,11 +350,9 @@ impl ScoreRangeVerifier {
         env.storage()
             .instance()
             .set(&DataKey::CircuitVersion, &circuit_version);
-            env.as_contract(&contract_id, || {
-                env.storage()
-                    .instance()
-                    .extend_ttl(INSTANCE_BUMP_THRESHOLD, INSTANCE_BUMP_AMOUNT);
-            });
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_BUMP_THRESHOLD, INSTANCE_BUMP_AMOUNT);
         env.events().publish(
             (symbol_short!("Init"),),
             (admin, vk_hash, circuit_version),
@@ -709,9 +707,9 @@ mod tests {
         while current < target {
             let next = core::cmp::min(current + chunk, target);
             env.as_contract(&contract_id, || {
-                env.storage()
-                    .instance()
-                    .extend_ttl(INSTANCE_BUMP_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+            env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_BUMP_THRESHOLD, INSTANCE_BUMP_AMOUNT);
             });
             env.ledger().set_sequence_number(next);
             current = next;
