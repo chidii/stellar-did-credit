@@ -214,6 +214,7 @@ PY
 IDENTITY_ID=""
 CREDIT_ID=""
 REVOCATION_ID=""
+GOVERNANCE_ID=""
 
 if $RESUME && [ -f "$DEPLOYMENTS_FILE" ]; then
   echo "Resume mode: reading existing deployments from $DEPLOYMENTS_FILE ..."
@@ -221,10 +222,12 @@ if $RESUME && [ -f "$DEPLOYMENTS_FILE" ]; then
   IDENTITY_ID=$(read_deployment_value "identity-oracle" "$DEPLOYMENTS_FILE")
   CREDIT_ID=$(read_deployment_value "credit-oracle" "$DEPLOYMENTS_FILE")
   REVOCATION_ID=$(read_deployment_value "revocation-registry" "$DEPLOYMENTS_FILE")
+  GOVERNANCE_ID=$(read_deployment_value "governance" "$DEPLOYMENTS_FILE")
 
   echo "  identity-oracle:     ${IDENTITY_ID:-(missing)}"
   echo "  credit-oracle:       ${CREDIT_ID:-(missing)}"
   echo "  revocation-registry: ${REVOCATION_ID:-(missing)}"
+  echo "  governance:          ${GOVERNANCE_ID:-(missing)}"
 elif $RESUME; then
   echo "Resume mode: no existing $DEPLOYMENTS_FILE found – proceeding with full deployment."
 fi
@@ -290,6 +293,18 @@ else
   echo "revocation-registry: $REVOCATION_ID"
 fi
 
+# 4. governance
+if [ -n "$GOVERNANCE_ID" ]; then
+  echo "Skipping governance (already deployed: $GOVERNANCE_ID)"
+else
+  echo "Deploying governance..."
+  GOVERNANCE_ID=$(stellar contract deploy \
+    --wasm target/wasm32-unknown-unknown/release/governance.wasm \
+    --source "$SOURCE" \
+    --network "$NETWORK")
+  echo "governance: $GOVERNANCE_ID"
+fi
+
 # Atomic JSON output is written *before* wiring to guarantee IDs are saved if a later step fails.
 echo "Saving intermediate deployment state to $DEPLOYMENTS_FILE..."
 cat > "$DEPLOYMENTS_FILE" <<EOF
@@ -299,7 +314,8 @@ cat > "$DEPLOYMENTS_FILE" <<EOF
   "contracts": {
     "identity-oracle": "$IDENTITY_ID",
     "credit-oracle": "$CREDIT_ID",
-    "revocation-registry": "$REVOCATION_ID"
+    "revocation-registry": "$REVOCATION_ID",
+    "governance": "$GOVERNANCE_ID"
   }
 }
 EOF
@@ -311,8 +327,9 @@ echo "Initializing contracts with admin: $ADMIN ..."
 stellar contract invoke --id "$CREDIT_ID" --source "$SOURCE" --network "$NETWORK" -- initialize --admin "$ADMIN" 2>/dev/null || true
 stellar contract invoke --id "$IDENTITY_ID" --source "$SOURCE" --network "$NETWORK" -- initialize --admin "$ADMIN" 2>/dev/null || true
 stellar contract invoke --id "$REVOCATION_ID" --source "$SOURCE" --network "$NETWORK" -- initialize --admin "$ADMIN" 2>/dev/null || true
+stellar contract invoke --id "$GOVERNANCE_ID" --source "$SOURCE" --network "$NETWORK" -- initialize --admin "$ADMIN" --credit_oracle "$CREDIT_ID" --quorum_required 1 2>/dev/null || true
 
-echo "4. Wiring revocation-registry to identity-oracle..."
+echo "5. Wiring revocation-registry to identity-oracle..."
 CURRENT_REGISTRY=$(stellar contract invoke --id "$IDENTITY_ID" --network "$NETWORK" -- get_revocation_registry 2>/dev/null || echo "None")
 
 if [[ "$CURRENT_REGISTRY" == *"$REVOCATION_ID"* ]]; then
@@ -327,7 +344,7 @@ else
   echo " -> Success."
 fi
 
-echo "5. Wiring identity-oracle to credit-oracle..."
+echo "6. Wiring identity-oracle to credit-oracle..."
 CURRENT_ID_ORACLE=$(stellar contract invoke --id "$CREDIT_ID" --network "$NETWORK" -- get_identity_oracle 2>/dev/null || echo "None")
 
 if [[ "$CURRENT_ID_ORACLE" == *"$IDENTITY_ID"* ]]; then
@@ -342,7 +359,19 @@ else
   echo " -> Success."
 fi
 
-echo "6. Running final deployment verification..."
+echo "7. Wiring governance as credit-oracle admin..."
+if ! stellar contract invoke --id "$CREDIT_ID" --network "$NETWORK" --source "$ADMIN" -- propose_new_admin --new_admin "$GOVERNANCE_ID"; then
+  echo "ERROR: Failed to propose governance as credit-oracle admin." >&2
+  exit 1
+fi
+echo " -> propose_new_admin succeeded. Step 2: governance accepts..."
+if ! stellar contract invoke --id "$GOVERNANCE_ID" --network "$NETWORK" --source "$ADMIN" -- accept_oracle_admin; then
+  echo "ERROR: Governance failed to accept credit-oracle admin role." >&2
+  exit 1
+fi
+echo " -> Governance wired as credit-oracle admin."
+
+echo "8. Running final deployment verification..."
 if [ -x "./scripts/verify-deployment.sh" ]; then
   if ! ./scripts/verify-deployment.sh; then
     echo "ERROR: Final wiring verification failed." >&2

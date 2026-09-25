@@ -1421,8 +1421,12 @@ impl CreditOracle {
         Ok(())
     }
 
-    /// Returns the configured identity-oracle contract ID, if any.
-    ///
+    /// Returns the current admin address, or None if not initialized.
+    pub fn get_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Admin)
+    }
+
+    /// Returns the configured identity oracle address.
     /// Returns `None` if cross-contract VC count lookup is not configured.
     pub fn get_identity_oracle(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::IdentityOracleId)

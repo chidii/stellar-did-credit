@@ -19,9 +19,15 @@ fi
 IDENTITY_ORACLE_ID=$(jq -r '.contracts["identity-oracle"] // .["identity-oracle"] | if type == "string" then . elif type == "object" and has("id") then .id elif type == "object" and has("address") then .address else empty end' "$DEPLOYMENTS_FILE")
 CREDIT_ORACLE_ID=$(jq -r '.contracts["credit-oracle"] // .["credit-oracle"] | if type == "string" then . elif type == "object" and has("id") then .id elif type == "object" and has("address") then .address else empty end' "$DEPLOYMENTS_FILE")
 REVOCATION_REGISTRY_ID=$(jq -r '.contracts["revocation-registry"] // .["revocation-registry"] | if type == "string" then . elif type == "object" and has("id") then .id elif type == "object" and has("address") then .address else empty end' "$DEPLOYMENTS_FILE")
+GOVERNANCE_ID=$(jq -r '.contracts["governance"] // .["governance"] | if type == "string" then . elif type == "object" and has("id") then .id elif type == "object" and has("address") then .address else empty end' "$DEPLOYMENTS_FILE")
 
 if [ -z "$IDENTITY_ORACLE_ID" ] || [ "$IDENTITY_ORACLE_ID" == "null" ]; then
     echo "Error: identity-oracle ID not found in $DEPLOYMENTS_FILE."
+    exit 1
+fi
+
+if [ -z "$GOVERNANCE_ID" ] || [ "$GOVERNANCE_ID" == "null" ]; then
+    echo "Error: governance ID not found in $DEPLOYMENTS_FILE."
     exit 1
 fi
 
@@ -48,17 +54,35 @@ if [ -n "$CREDIT_ORACLE_ID" ] && [ "$CREDIT_ORACLE_ID" != "null" ]; then
       --id "$CREDIT_ORACLE_ID" \
       --network "$NETWORK" \
       -- get_identity_oracle 2>/dev/null || echo "error")
-    
+
     if [ "$IDENTITY_ADDR" == "error" ]; then
         echo "Error: failed to invoke get_identity_oracle on credit-oracle."
         exit 1
     fi
-    
+
     echo "Identity oracle configured as: $IDENTITY_ADDR"
     if [ "$IDENTITY_ADDR" == "null" ] || [ -z "$IDENTITY_ADDR" ]; then
         echo "Warning: identity-oracle is not linked to credit-oracle!"
         exit 1
     fi
+
+    echo "Verifying governance is credit-oracle admin..."
+    CREDIT_ADMIN=$(stellar contract invoke \
+      --id "$CREDIT_ORACLE_ID" \
+      --network "$NETWORK" \
+      -- get_admin 2>/dev/null || echo "error")
+
+    if [ "$CREDIT_ADMIN" == "error" ]; then
+        echo "Error: failed to invoke get_admin on credit-oracle."
+        exit 1
+    fi
+
+    echo "Credit-oracle admin: $CREDIT_ADMIN"
+    if [ "$CREDIT_ADMIN" != "$GOVERNANCE_ID" ]; then
+        echo "Error: governance ($GOVERNANCE_ID) is not credit-oracle admin ($CREDIT_ADMIN)."
+        exit 1
+    fi
+    echo "Governance is correctly wired as credit-oracle admin."
 fi
 
 echo "Deployment configuration verified successfully!"
