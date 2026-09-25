@@ -174,6 +174,29 @@ The JSON-LD document SHOULD validate against a JSON Schema to ensure structural 
 3. The subject uploads the document to IPFS.
 4. The subject calls the `anchor_did` function on the `identity-oracle` contract, passing the CID.
 
+### 3.1.1 CID Validation
+
+The `anchor_did` function validates the `did_doc_cid` argument before storing it.
+Invalid CIDs are rejected with `IdentityOracleError::InvalidCID` so that DID resolution
+does not silently fail on malformed IPFS pointers.
+
+**Accepted formats:**
+
+- **CIDv0** — IPFS CID version 0, base58btc-encoded multihash. The string must
+  start with `Qm` and be exactly 46 characters long.
+- **CIDv1** — IPFS CID version 1, multibase base32 (lowercase). The string must
+  start with `bafy`.
+- **URI form** — either of the above prefixed with `ipfs://`.
+
+**Length bounds:** the stored string must be between 7 and 128 bytes
+(`MAX_CID_LENGTH`). The 7-byte lower bound rejects empty strings and trivially
+short garbage; the upper bound keeps the storage slot bounded.
+
+**Out of scope:** the contract does not perform full multibase / multihash parsing
+or checksum verification. Prefix and length checks are sufficient to reject
+malformed pointers at anchor time. Off-chain resolvers MUST still validate the
+CID checksum before fetching from IPFS.
+
 ### 3.2 Read (Resolve)
 
 To resolve a `did:stellar` identifier:

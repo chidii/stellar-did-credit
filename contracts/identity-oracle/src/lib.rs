@@ -1553,6 +1553,68 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn anchor_did_cid_validation_v0() {
+        // CIDv0: base58btc multihash, starts with "Qm", 46 chars total.
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, IdentityOracle);
+        let client = IdentityOracleClient::new(&env, &contract_id);
+
+        let subject = Address::generate(&env);
+        let cid = String::from_str(&env, "QmYwAPJzagoJzrKSTTkG8w6zWZSNxrCYhpDkxQottEwHym");
+        assert_eq!(cid.len(), 46);
+        client.anchor_did(&subject, &cid);
+        assert_eq!(client.get_did_document(&subject), Some(cid));
+    }
+
+    #[test]
+    fn anchor_did_cid_validation_v1() {
+        // CIDv1: multibase base32, starts with "bafy".
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, IdentityOracle);
+        let client = IdentityOracleClient::new(&env, &contract_id);
+
+        let subject = Address::generate(&env);
+        let cid = String::from_str(&env, "bafy2bzacedw4hc6k2vxtcmfmr3jtcl6yvqohqmvtqj7lhyzuejcxgxvl6yv4");
+        assert!(cid.len() <= MAX_CID_LENGTH);
+        client.anchor_did(&subject, &cid);
+        assert_eq!(client.get_did_document(&subject), Some(cid));
+    }
+
+    #[test]
+    fn anchor_did_cid_validation_invalid() {
+        // Strings that are not valid IPFS CIDs must be rejected.
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, IdentityOracle);
+        let client = IdentityOracleClient::new(&env, &contract_id);
+
+        let subject = Address::generate(&env);
+
+        // Empty string.
+        let empty = String::from_str(&env, "");
+        assert_eq!(
+            client.try_anchor_did(&subject, &empty),
+            Err(Ok(IdentityOracleError::InvalidCID))
+        );
+
+        // Wrong prefix (not "Qm", "bafy", or "ipfs://").
+        let bad_prefix = String::from_str(&env, "notacidvalue");
+        assert_eq!(
+            client.try_anchor_did(&subject, &bad_prefix),
+            Err(Ok(IdentityOracleError::InvalidCID))
+        );
+
+        // Arbitrary text that is neither a CID nor a valid prefix.
+        let gibberish = String::from_str(&env, "hello world");
+        assert_eq!(
+            client.try_anchor_did(&subject, &gibberish),
+            Err(Ok(IdentityOracleError::InvalidCID))
+        );
+    }
+
     fn test_anchor_did_accepts_valid_ipfs_cid() {
         let env = Env::default();
         env.mock_all_auths();
