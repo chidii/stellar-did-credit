@@ -454,6 +454,25 @@ impl ScoreRangeVerifier {
         Ok(true)
     }
 
+    /// Test-only: mark a proof hash as consumed without running verification.
+    /// Used to exercise the replay-protection TTL logic without needing a
+    /// valid Groth16 proof (which requires the trusted-setup artifacts).
+    #[cfg(test)]
+    pub fn test_consume_proof(env: Env, proof_hash: BytesN<32>) {
+        let key = DataKey::ConsumedProof(proof_hash);
+        env.storage().persistent().set(&key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PERS_TTL_THRESHOLD, PERS_TTL_EXTEND);
+    }
+
+    /// Test-only: read whether a proof hash is marked as consumed.
+    #[cfg(test)]
+    pub fn test_is_consumed(env: Env, proof_hash: BytesN<32>) -> bool {
+        env.storage()
+            .persistent()
+            .has(&DataKey::ConsumedProof(proof_hash))
+    }
     /// Read the stored verification-key hash.
     pub fn get_vk_hash(env: Env) -> Option<BytesN<32>> {
         env.storage().instance().get(&DataKey::VkHash)
@@ -670,6 +689,49 @@ mod tests {
         assert_eq!(res, Err(Ok(VerifierError::InvalidProofSize)));
     }
 
+    #[test]
+    fn test_consumed_proof_replay_protection_survives_ledger_advance() {
+        use soroban_sdk::testutils::Ledger as _;
+
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ScoreRangeVerifier);
+        let client = ScoreRangeVerifierClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let vk_hash = BytesN::from_array(&env, &[0xAB; 32]);
+        client.initialize(&admin, &vk_hash, &CIRCUIT_VERSION);
+
+        assert_eq!(PERS_TTL_THRESHOLD, 120_960);
+        assert_eq!(PERS_TTL_EXTEND, 518_400);
+
+        // Write a ConsumedProof entry via the test-only helper (bypasses
+        // Groth16 verification, which cannot be run in a unit test without
+        // the trusted-setup artifacts).
+        let proof_hash = BytesN::from_array(&env, &[0x77; 32]);
+        client.test_consume_proof(&proof_hash);
+
+        assert!(client.test_is_consumed(&proof_hash));
+
+        // Advance the ledger in chunks smaller than INSTANCE_BUMP_AMOUNT,
+        // re-extending the instance's TTL before each step. A single jump
+        // past PERS_TTL_EXTEND would archive the instance itself.
+        let chunk: u32 = INSTANCE_BUMP_AMOUNT - 1_000;
+        let mut current: u32 = env.ledger().sequence();
+        let target: u32 = current + PERS_TTL_EXTEND + 1_000;
+
+        while current < target {
+            let next = core::cmp::min(current + chunk, target);
+            env.storage()
+                .instance()
+                .extend_ttl(INSTANCE_BUMP_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+            env.ledger().set_sequence_number(next);
+            current = next;
+        }
+
+        // The ConsumedProof entry must still exist after advancing past
+        // PERS_TTL_EXTEND — this is the actual replay-protection guarantee.
+        assert!(client.test_is_consumed(&proof_hash));
+    }
     #[test]
     fn test_verify_score_range_requires_initialization() {
         let env = Env::default();
