@@ -454,25 +454,6 @@ impl ScoreRangeVerifier {
         Ok(true)
     }
 
-    /// Test-only: mark a proof hash as consumed without running verification.
-    /// Used to exercise the replay-protection TTL logic without needing a
-    /// valid Groth16 proof (which requires the trusted-setup artifacts).
-    #[cfg(test)]
-    pub fn test_consume_proof(env: Env, proof_hash: BytesN<32>) {
-        let key = DataKey::ConsumedProof(proof_hash);
-        env.storage().persistent().set(&key, &true);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, PERS_TTL_THRESHOLD, PERS_TTL_EXTEND);
-    }
-
-    /// Test-only: read whether a proof hash is marked as consumed.
-    #[cfg(test)]
-    pub fn test_is_consumed(env: Env, proof_hash: BytesN<32>) -> bool {
-        env.storage()
-            .persistent()
-            .has(&DataKey::ConsumedProof(proof_hash))
-    }
     /// Read the stored verification-key hash.
     pub fn get_vk_hash(env: Env) -> Option<BytesN<32>> {
         env.storage().instance().get(&DataKey::VkHash)
@@ -708,9 +689,13 @@ mod tests {
         // Groth16 verification, which cannot be run in a unit test without
         // the trusted-setup artifacts).
         let proof_hash = BytesN::from_array(&env, &[0x77; 32]);
-        client.test_consume_proof(&proof_hash);
-
-        assert!(client.test_is_consumed(&proof_hash));
+        env.as_contract(&contract_id, || {
+            let key = DataKey::ConsumedProof(proof_hash.clone());
+            env.storage().persistent().set(&key, &true);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, PERS_TTL_THRESHOLD, PERS_TTL_EXTEND);
+        });
 
         // Advance the ledger in chunks smaller than INSTANCE_BUMP_AMOUNT,
         // re-extending the instance's TTL before each step. A single jump
@@ -730,7 +715,12 @@ mod tests {
 
         // The ConsumedProof entry must still exist after advancing past
         // PERS_TTL_EXTEND — this is the actual replay-protection guarantee.
-        assert!(client.test_is_consumed(&proof_hash));
+        env.as_contract(&contract_id, || {
+            assert!(env
+                .storage()
+                .persistent()
+                .has(&DataKey::ConsumedProof(proof_hash.clone())));
+        });
     }
     #[test]
     fn test_verify_score_range_requires_initialization() {
