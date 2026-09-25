@@ -86,7 +86,7 @@ and fill in the values, or export them before running `npm start`.
 | `RETRY_BASE_DELAY_MS`   | `1000`     | Base delay for exponential backoff, in milliseconds.                           |
 | `EVENT_DRIVEN`          | `false`    | Enables event-driven mode. Subscribes to `VCAnch` and `Revoked` events to trigger immediate feed cycles. |
 | `EVENT_POLL_INTERVAL_MS`| `30000`    | How often to poll for events, in milliseconds. Used when `EVENT_DRIVEN=true`.  |
-| `FEEDER_ALLOW_PARTIAL_STATS` | `true` | Whether stats from an incomplete Horizon pagination pass are written on-chain. Set to `false` to suppress `update_tx_stats` for partial fetches. Any value other than `false` means `true`. |
+| `FEEDER_ALLOW_PARTIAL_STATS` | `true` | Whether stats from an incomplete Horizon pagination pass are written on-chain. Defaults to `true` (partial data is submitted rather than discarded). Set to `"false"` to suppress `update_tx_stats` for partial fetches, leaving previous complete stats in place. Any value other than `"false"` means `true`. |
 
 ### Partial Horizon results
 
@@ -144,8 +144,8 @@ When `HEALTH_PORT` is set, the feeder starts a lightweight HTTP server (using No
 | Endpoint       | Status | Description |
 | -------------- | ------ | ----------- |
 | `GET /health`  | 200    | Always returns liveness info: `{"status":"ok","lastCycleAt":"<iso or null>","successCount":<n>,"failureCount":<n>}`. Counts are cumulative per-subject sync outcomes across all completed cycles. |
-| `GET /ready`   | 200    | Last feed cycle completed with zero failures. |
-| `GET /ready`   | 503    | Feeder has never completed a cycle, or the last cycle had at least one failure. |
+| `GET /ready`   | 200    | The feeder has completed at least one full feed cycle with zero failures. |
+| `GET /ready`   | 503    | The feeder has never completed a successful cycle yet (returns 503 until the first fully successful cycle completes). |
 
 Example:
 
