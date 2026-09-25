@@ -702,7 +702,7 @@ mod tests {
         // past PERS_TTL_EXTEND would archive the instance itself.
         let chunk: u32 = INSTANCE_BUMP_AMOUNT - 1_000;
         let mut current: u32 = env.ledger().sequence();
-        let target: u32 = current + PERS_TTL_EXTEND + 1_000;
+        let target: u32 = current + PERS_TTL_EXTEND - 1_000;
 
         while current < target {
             let next = core::cmp::min(current + chunk, target);
