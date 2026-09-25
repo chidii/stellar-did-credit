@@ -83,7 +83,7 @@ mod tests {
         let event_admin: soroban_sdk::Address = data.clone().try_into_val(&env).unwrap();
         assert_eq!(
             event_admin, admin,
-            "Init event admin mismatch for revocation-registry"
+            "Initialized event admin mismatch for revocation-registry"
         );
 
         // Issue #665: governance contract must also emit an Initialized event
