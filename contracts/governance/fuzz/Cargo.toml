@@ -16,7 +16,14 @@ members = ["."]
 
 [[bin]]
 name = "vote_weight"
-path = "fuzz_targets/vote_weight.rs"
+path = "fuzz_targets/fuzz_vote.rs"
+bench = false
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_vote"
+path = "fuzz_targets/fuzz_vote.rs"
 bench = false
 test = false
 doc = false

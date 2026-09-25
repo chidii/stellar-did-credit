@@ -150,6 +150,8 @@ impl RevocationRegistry {
         env.storage()
             .instance()
             .set(&RevocationKey::IdentityOracleId, &identity_oracle_id);
+        env.events()
+            .publish((symbol_short!("IdOSet"),), identity_oracle_id);
         Ok(())
     }
 
@@ -314,6 +316,13 @@ impl RevocationRegistry {
         result
     }
 
+    pub fn list_revoked_for_issuer(env: Env, issuer: Address) -> Vec<BytesN<32>> {
+        env.storage()
+            .persistent()
+            .get(&RevocationKey::IssuerRevokedList(issuer))
+            .unwrap_or(Vec::new(&env))
+    }
+
     pub fn batch_revoke(
         env: Env,
         issuer: Address,
@@ -416,6 +425,8 @@ impl RevocationRegistry {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    use soroban_sdk::testutils::Events;
+    use soroban_sdk::TryIntoVal;
     use soroban_sdk::{testutils::Address as _, Env};
 
     #[test]
@@ -460,6 +471,37 @@ mod tests {
 
         let res = client.try_set_batch_limit(&admin, &101);
         assert_eq!(res, Err(Ok(RevocationRegistryError::InvalidBatchLimit)));
+    }
+
+    #[test]
+    fn set_identity_oracle_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RevocationRegistry);
+        let client = RevocationRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let identity_oracle_id = Address::generate(&env);
+        client.initialize(&admin);
+        env.events().all();
+
+        client.set_identity_oracle(&identity_oracle_id);
+
+        let events = env.events().all();
+        assert_eq!(events.len(), 1, "expected exactly one event");
+        let (event_contract_id, topics, data) = events.get(0).unwrap();
+        assert_eq!(event_contract_id, contract_id, "event contract id mismatch");
+        assert_eq!(topics.len(), 1, "expected 1 topic element");
+        let topic: Symbol = topics
+            .get(0)
+            .unwrap()
+            .try_into_val(&env)
+            .expect("topic should be a Symbol");
+        assert_eq!(topic, symbol_short!("IdOSet"));
+        let event_identity_oracle_id: Address = data
+            .try_into_val(&env)
+            .expect("data should be an Address");
+        assert_eq!(event_identity_oracle_id, identity_oracle_id);
     }
 
     #[test]
@@ -712,6 +754,37 @@ mod tests {
 
         let zero_limit = client.list_revoked(&issuer, &0, &0);
         assert_eq!(zero_limit.len(), 0);
+
+        let all_revoked = client.list_revoked_for_issuer(&issuer);
+        assert_eq!(all_revoked.len(), 4);
+        assert_eq!(all_revoked.get(0).unwrap(), hash1);
+        assert_eq!(all_revoked.get(1).unwrap(), hash2);
+        assert_eq!(all_revoked.get(2).unwrap(), hash3);
+        assert_eq!(all_revoked.get(3).unwrap(), hash4);
+    }
+
+    #[test]
+    fn test_list_revoked_for_issuer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RevocationRegistry);
+        let client = RevocationRegistryClient::new(&env, &contract_id);
+
+        let issuer = Address::generate(&env);
+        let subject = Address::generate(&env);
+        let hash1 = BytesN::from_array(&env, &[1u8; 32]);
+        let hash2 = BytesN::from_array(&env, &[2u8; 32]);
+        let mut batch = Vec::new(&env);
+        batch.push_back(hash2.clone());
+
+        assert_eq!(client.list_revoked_for_issuer(&issuer).len(), 0);
+        client.revoke(&issuer, &subject, &hash1);
+        client.batch_revoke(&issuer, &batch);
+
+        let revoked = client.list_revoked_for_issuer(&issuer);
+        assert_eq!(revoked.len(), 2);
+        assert_eq!(revoked.get(0).unwrap(), hash1);
+        assert_eq!(revoked.get(1).unwrap(), hash2);
     }
 
     #[test]

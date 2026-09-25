@@ -21,7 +21,6 @@ import {
   VCRecord,
   GovernanceProposal,
   BatchResult,
-  RecencyDecayConfig,
 } from "./index";
 import { xdr, Keypair } from "@stellar/stellar-sdk";
 
@@ -88,8 +87,12 @@ jest.mock("@stellar/stellar-sdk", () => ({
   nativeToScVal: (value: unknown, options?: { type?: unknown }) => ({
     value,
     type: options?.type,
+    address: () => ({
+      toXDR: () => Buffer.from(String(value)),
+    }),
   }),
   scValToNative: (scVal: { value?: unknown }) => scVal?.value,
+  hash: (data: Uint8Array | Buffer) => Buffer.from(data).subarray(0, 32),
   SorobanRpc: {
     Server: jest.fn().mockImplementation(() => ({
       getAccount: mockGetAccount,
@@ -157,6 +160,86 @@ describe("StellarDIDCreditSDK", () => {
   });
 
   describe("governance", () => {
+    const adminAddress = "GADMINAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const adminKeypair = { publicKey: () => adminAddress };
+
+    describe("admin methods", () => {
+      beforeEach(() => {
+        mockGetTransaction.mockResolvedValue({ status: "SUCCESS" });
+      });
+
+      it("registers a voter", async () => {
+        mockSimulateTransaction.mockResolvedValue({
+          result: { retval: { value: undefined } },
+        });
+
+        const sdk = new StellarDIDCreditSDK(mockConfig);
+        const result = await sdk.governance.registerVoter(
+          adminKeypair as never,
+          subjectAddress,
+          100n,
+        );
+
+        expect(result).toBe("mock-tx-hash");
+        expect(mockGetAccount).toHaveBeenCalledWith(adminAddress);
+        expect(mockGetTransaction).toHaveBeenCalledWith("mock-tx-hash");
+        expect(mockContractCalls[0]).toMatchObject({
+          contractId: mockConfig.governanceId,
+          method: "register_voter",
+        });
+        expect(mockContractCalls[0]?.args).toHaveLength(3);
+        expect(mockContractCalls[0]?.args[2]).toMatchObject({
+          value: 100n,
+          type: "i128",
+        });
+      });
+
+      it("updates a voter weight", async () => {
+        mockSimulateTransaction.mockResolvedValue({
+          result: { retval: { value: undefined } },
+        });
+
+        const sdk = new StellarDIDCreditSDK(mockConfig);
+        const result = await sdk.governance.updateVoterWeight(
+          adminKeypair as never,
+          subjectAddress,
+          200n,
+        );
+
+        expect(result).toBe("mock-tx-hash");
+        expect(mockContractCalls[0]).toMatchObject({
+          contractId: mockConfig.governanceId,
+          method: "update_voter_weight",
+        });
+        expect(mockContractCalls[0]?.args[2]).toMatchObject({
+          value: 200n,
+          type: "i128",
+        });
+      });
+
+      it("sets the quorum", async () => {
+        mockSimulateTransaction.mockResolvedValue({
+          result: { retval: { value: undefined } },
+        });
+
+        const sdk = new StellarDIDCreditSDK(mockConfig);
+        const result = await sdk.governance.setQuorum(
+          adminKeypair as never,
+          1000n,
+        );
+
+        expect(result).toBe("mock-tx-hash");
+        expect(mockContractCalls[0]).toMatchObject({
+          contractId: mockConfig.governanceId,
+          method: "set_quorum",
+        });
+        expect(mockContractCalls[0]?.args[1]).toMatchObject({
+          value: 1000n,
+          type: "i128",
+        });
+      });
+    });
+
     const governanceWeights: ScoringWeights = {
       vcWeight: 50,
       txWeight: 25,
@@ -1031,6 +1114,65 @@ describe("StellarDIDCreditSDK", () => {
     });
   });
 
+  describe("batchAnchorVCs", () => {
+    beforeEach(() => {
+      mockSimulateTransaction.mockReset();
+      mockGetAccount.mockReset();
+      mockSendTransaction.mockReset();
+      mockGetTransaction.mockReset();
+      mockContractCalls.length = 0;
+      mockGetAccount.mockResolvedValue({ sequenceNumber: () => "1" });
+      mockSimulateTransaction.mockResolvedValue({ result: {} });
+      mockSendTransaction.mockResolvedValue({
+        status: "PENDING",
+        hash: "mock-tx-hash",
+      });
+      mockGetTransaction.mockResolvedValue({ status: "SUCCESS" });
+    });
+
+    it("chunks entries into transactions of at most 10 operations", async () => {
+      const entries = Array.from({ length: 11 }, (_, index) => ({
+        subject: subjectAddress,
+        vcHash: Buffer.alloc(32, index + 1),
+        ...(index === 0 ? { type: "kyc" } : {}),
+      }));
+
+      const sdk = new StellarDIDCreditSDK(mockConfig);
+      const result = await sdk.batchAnchorVCs(issuerKeypair as never, entries);
+
+      expect(result.success).toBe(true);
+      expect(result.results).toHaveLength(2);
+      expect(result.results[0]?.vcHashes).toHaveLength(10);
+      expect(result.results[1]?.vcHashes).toHaveLength(1);
+      expect(mockSendTransaction).toHaveBeenCalledTimes(2);
+      expect(mockContractCalls.filter((call) => call.method === "anchor_vc"))
+        .toHaveLength(10);
+      expect(
+        mockContractCalls.filter((call) => call.method === "anchor_vc_typed"),
+      ).toHaveLength(1);
+    });
+
+    it("reports a failed chunk and continues with later chunks", async () => {
+      const entries = Array.from({ length: 11 }, (_, index) => ({
+        subject: subjectAddress,
+        vcHash: Buffer.alloc(32, index + 1),
+      }));
+      mockSimulateTransaction
+        .mockResolvedValueOnce({ error: "anchor_vc rejected" })
+        .mockResolvedValueOnce({ result: {} });
+
+      const sdk = new StellarDIDCreditSDK(mockConfig);
+      const result = await sdk.batchAnchorVCs(issuerKeypair as never, entries);
+
+      expect(result.success).toBe(false);
+      expect(result.failedChunks).toBe(1);
+      expect(result.results).toHaveLength(2);
+      expect(result.results[0]?.status).toBe("failed");
+      expect(result.results[1]?.status).toBe("success");
+      expect(mockSendTransaction).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe("verifyVC", () => {
     it("returns true for a valid hash", async () => {
       mockSimulateTransaction.mockResolvedValue({
@@ -1355,8 +1497,6 @@ describe("StellarDIDCreditSDK", () => {
           subjectAddress,
         ),
       ).rejects.toMatchObject({
-        name: "SDKError",
-        code: "TRANSACTION_FAILED",
         name: "CreditOracleError",
         code: 0,
         contractName: "credit-oracle",
@@ -1551,6 +1691,26 @@ describe("StellarDIDCreditSDK", () => {
     });
   });
 
+  describe("listRevokedByIssuer", () => {
+    it("returns revoked credential hashes as Buffers", async () => {
+      const revokedHashes = [Buffer.alloc(32, 1), Buffer.alloc(32, 2)];
+      mockSimulateTransaction.mockResolvedValue({
+        result: { retval: { value: revokedHashes } },
+      });
+
+      const sdk = new StellarDIDCreditSDK(mockConfig);
+      const result = await sdk.listRevokedByIssuer(issuerKeypair.publicKey());
+
+      expect(result).toEqual(revokedHashes);
+      expect(result.every((hash) => Buffer.isBuffer(hash))).toBe(true);
+      expect(mockLastContractCall).toMatchObject({
+        contractId: mockConfig.revocationRegistryId,
+        method: "list_revoked_for_issuer",
+      });
+      expect(mockLastContractCall?.args).toHaveLength(1);
+    });
+  });
+
   describe("getCredentialType", () => {
     it("returns the credential type label for a valid hash", async () => {
       mockSimulateTransaction.mockResolvedValue({
@@ -1655,6 +1815,86 @@ describe("StellarDIDCreditSDK", () => {
     });
   });
 
+  describe("isDeactivated", () => {
+    it("returns true when subject has deactivated identity", async () => {
+      mockSimulateTransaction.mockResolvedValue({
+        result: {
+          retval: { value: true },
+        },
+      });
+
+      const sdk = new StellarDIDCreditSDK(mockConfig);
+      const result = await sdk.isDeactivated(subjectAddress);
+
+      expect(result).toBe(true);
+      expect(mockLastContractCall?.method).toBe("is_deactivated");
+      expect(mockLastContractCall?.args).toHaveLength(1);
+    });
+
+    it("returns false when subject has active identity", async () => {
+      mockSimulateTransaction.mockResolvedValue({
+        result: {
+          retval: { value: false },
+        },
+      });
+
+      const sdk = new StellarDIDCreditSDK(mockConfig);
+      const result = await sdk.isDeactivated(subjectAddress);
+
+      expect(result).toBe(false);
+      expect(mockLastContractCall?.method).toBe("is_deactivated");
+    });
+
+    it("throws on simulation error", async () => {
+      mockSimulateTransaction.mockResolvedValue({ error: "rpc error" });
+
+      const sdk = new StellarDIDCreditSDK(mockConfig);
+
+      await expect(sdk.isDeactivated(subjectAddress)).rejects.toMatchObject({
+        name: "IdentityOracleError",
+        code: 0,
+        contractName: "identity-oracle",
+        message: "rpc error",
+      });
+    });
+  });
+
+  describe("reactivateIdentity", () => {
+    it("submits transaction to reactivate identity", async () => {
+      mockSimulateTransaction.mockResolvedValue({
+        result: {
+          retval: { value: undefined }, // return value is ()
+        },
+      });
+
+      const sdk = new StellarDIDCreditSDK(mockConfig);
+      const result = await sdk.reactivateIdentity(subjectKeypair as never);
+
+      expect(result).toBe("mock-tx-hash");
+      expect(mockGetAccount).toHaveBeenCalledWith(subjectAddress);
+      expect(mockSendTransaction).toHaveBeenCalled();
+      expect(mockContractCalls[mockContractCalls.length - 1]).toMatchObject({
+        contractId: mockConfig.identityOracleId,
+        method: "reactivate_identity",
+      });
+    });
+
+    it("throws on simulation error", async () => {
+      mockSimulateTransaction.mockResolvedValue({ error: "rpc error" });
+
+      const sdk = new StellarDIDCreditSDK(mockConfig);
+
+      await expect(
+        sdk.reactivateIdentity(subjectKeypair as never),
+      ).rejects.toMatchObject({
+        name: "IdentityOracleError",
+        code: 0,
+        contractName: "identity-oracle",
+        message: "rpc error",
+      });
+    });
+  });
+
   describe("getWeights", () => {
     it("returns scoring weights from the credit-oracle", async () => {
       mockSimulateTransaction.mockResolvedValue({
@@ -1691,6 +1931,49 @@ describe("StellarDIDCreditSDK", () => {
         contractName: "credit-oracle",
         message: "rpc error",
       });
+    });
+  });
+
+  describe("getPendingWeights", () => {
+    it("returns pending scoring weights and their effective ledger", async () => {
+      mockSimulateTransaction.mockResolvedValue({
+        result: {
+          retval: {
+            value: {
+              weights: {
+                vc_weight: 45,
+                tx_weight: 30,
+                repayment_weight: 25,
+              },
+              effective_ledger: 1_234_567,
+            },
+          },
+        },
+      });
+
+      const sdk = new StellarDIDCreditSDK(mockConfig);
+      const result = await sdk.getPendingWeights();
+
+      expect(result).toEqual({
+        weights: {
+          vcWeight: 45,
+          txWeight: 30,
+          repaymentWeight: 25,
+        },
+        effectiveLedger: 1_234_567,
+      });
+      expect(mockLastContractCall?.method).toBe("get_pending_weights");
+    });
+
+    it("returns null when no pending weights exist", async () => {
+      mockSimulateTransaction.mockResolvedValue({
+        result: { retval: { value: null } },
+      });
+
+      const sdk = new StellarDIDCreditSDK(mockConfig);
+
+      await expect(sdk.getPendingWeights()).resolves.toBeNull();
+      expect(mockLastContractCall?.method).toBe("get_pending_weights");
     });
   });
 
@@ -1765,6 +2048,79 @@ describe("StellarDIDCreditSDK", () => {
         name: "CreditOracleError",
         code: 0,
         contractName: "credit-oracle",
+        message: "rpc error",
+      });
+    });
+  });
+
+  describe("getIssuerTier", () => {
+    it("returns tier weight for an issuer", async () => {
+      mockSimulateTransaction.mockResolvedValue({
+        result: {
+          retval: { value: 150 },
+        },
+      });
+
+      const sdk = new StellarDIDCreditSDK(mockConfig);
+      const result = await sdk.getIssuerTier(issuerKeypair.publicKey());
+
+      expect(result).toBe(150);
+      expect(mockLastContractCall?.method).toBe("get_issuer_tier");
+      expect(mockLastContractCall?.args).toHaveLength(1);
+    });
+
+    it("throws on simulation error", async () => {
+      mockSimulateTransaction.mockResolvedValue({ error: "rpc error" });
+
+      const sdk = new StellarDIDCreditSDK(mockConfig);
+
+      await expect(sdk.getIssuerTier(issuerKeypair.publicKey())).rejects.toMatchObject({
+        name: "IdentityOracleError",
+        code: 0,
+        contractName: "identity-oracle",
+        message: "rpc error",
+      });
+    });
+  });
+
+  describe("setIssuerTier", () => {
+    const adminAddress = "GADMINAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const adminKeypair = { publicKey: () => adminAddress };
+
+    it("submits transaction to set issuer tier", async () => {
+      mockSimulateTransaction.mockResolvedValue({
+        result: {
+          retval: { value: undefined },
+        },
+      });
+
+      const sdk = new StellarDIDCreditSDK(mockConfig);
+      const result = await sdk.setIssuerTier(
+        adminKeypair as never,
+        issuerKeypair.publicKey(),
+        120,
+      );
+
+      expect(result).toBe("mock-tx-hash");
+      expect(mockGetAccount).toHaveBeenCalledWith(adminAddress);
+      expect(mockSendTransaction).toHaveBeenCalled();
+      expect(mockContractCalls[mockContractCalls.length - 1]).toMatchObject({
+        contractId: mockConfig.identityOracleId,
+        method: "set_issuer_tier",
+      });
+    });
+
+    it("throws on simulation error", async () => {
+      mockSimulateTransaction.mockResolvedValue({ error: "rpc error" });
+
+      const sdk = new StellarDIDCreditSDK(mockConfig);
+
+      await expect(
+        sdk.setIssuerTier(adminKeypair as never, issuerKeypair.publicKey(), 120),
+      ).rejects.toMatchObject({
+        name: "IdentityOracleError",
+        code: 0,
+        contractName: "identity-oracle",
         message: "rpc error",
       });
     });
@@ -1889,6 +2245,136 @@ describe("StellarDIDCreditSDK", () => {
       expect(error).toBeInstanceOf(Error);
       expect(error.name).toBe("ScoreNotComputedError");
       expect(error.message).toContain(subjectAddress);
+    });
+  });
+
+  describe("getTxStats", () => {
+    it("returns TxStats on success", async () => {
+      mockSimulateTransaction.mockResolvedValueOnce({
+        result: {
+          retval: {
+            value: {
+              volume_30d: 1000n,
+              tx_count_30d: 5,
+              avg_counterparties: 2,
+            },
+          },
+        },
+      });
+      const sdk = new StellarDIDCreditSDK(mockConfig);
+      const stats = await sdk.getTxStats(subjectAddress);
+      expect(stats).toEqual({
+        volume30d: 1000n,
+        txCount30d: 5,
+        avgCounterparties: 2,
+      });
+    });
+
+    it("returns null if not found", async () => {
+      mockSimulateTransaction.mockResolvedValueOnce({
+        result: { retval: { value: null } },
+      });
+      const sdk = new StellarDIDCreditSDK(mockConfig);
+      const stats = await sdk.getTxStats(subjectAddress);
+      expect(stats).toBeNull();
+    });
+  });
+
+  describe("getRepaymentRecord", () => {
+    it("returns RepaymentRecord on success", async () => {
+      mockSimulateTransaction.mockResolvedValueOnce({
+        result: {
+          retval: {
+            value: {
+              on_time_count: 10,
+              total_count: 12,
+              total_repaid: 500n,
+            },
+          },
+        },
+      });
+      const sdk = new StellarDIDCreditSDK(mockConfig);
+      const record = await sdk.getRepaymentRecord(subjectAddress);
+      expect(record).toEqual({
+        onTimeCount: 10,
+        totalCount: 12,
+        totalRepaid: 500n,
+      });
+    });
+
+    it("returns null if not found", async () => {
+      mockSimulateTransaction.mockResolvedValueOnce({
+        result: { retval: { value: null } },
+      });
+      const sdk = new StellarDIDCreditSDK(mockConfig);
+      const record = await sdk.getRepaymentRecord(subjectAddress);
+      expect(record).toBeNull();
+    });
+  });
+
+  describe("verifyScoreProof", () => {
+    it("returns true on successful verification", async () => {
+      mockGetAccount.mockResolvedValueOnce({ sequenceNumber: () => "123" });
+      mockSimulateTransaction.mockResolvedValueOnce({
+        result: { retval: { value: null } },
+      });
+      mockSendTransaction.mockResolvedValueOnce({
+        status: "PENDING",
+        hash: "tx-hash-verify",
+      });
+      mockGetTransaction.mockResolvedValueOnce({ status: "SUCCESS" });
+
+      const sdk = new StellarDIDCreditSDK(mockConfig);
+      const result = await sdk.verifyScoreProof(
+        { publicKey: () => subjectAddress } as unknown as Keypair,
+        subjectAddress,
+        600,
+        new Uint8Array([1, 2, 3]),
+        "C_VERIFIER"
+      );
+      expect(result).toBe(true);
+    });
+  });
+
+  describe("generateScoreProof", () => {
+    it("throws if score not computed", async () => {
+      const sdk = new StellarDIDCreditSDK(mockConfig);
+      jest.spyOn(sdk, "getScore").mockResolvedValueOnce(null);
+
+      await expect(sdk.generateScoreProof(subjectAddress, 600)).rejects.toThrow(
+        "Score not computed"
+      );
+    });
+
+    it("uses default stats if tx/repayment records are missing", async () => {
+      const sdk = new StellarDIDCreditSDK(mockConfig);
+      jest.spyOn(sdk, "getScore").mockResolvedValueOnce({
+        score: 600,
+        lastUpdated: 0,
+        vcCount: 1,
+        repaymentRate: 0,
+        txVolume30d: 0n,
+        previousScore: 0,
+        computedAtLedger: 0,
+        stale: false,
+      });
+      jest.spyOn(sdk, "getTxStats").mockResolvedValueOnce(null);
+      jest.spyOn(sdk, "getRepaymentRecord").mockResolvedValueOnce(null);
+      jest.spyOn(sdk, "getWeights").mockResolvedValueOnce({
+        vcWeight: 40,
+        txWeight: 30,
+        repaymentWeight: 30,
+      });
+
+      // We just expect it to attempt generating a proof without throwing on missing stats
+      // Since ZkWasm might not be loaded in Jest node environment without proper wasm support,
+      // we mock ZkWasm.generate_score_proof or just let it try and if it fails on WASM, 
+      // that's fine, we just want to cover the `|| { default }` lines before it.
+      const ZkWasm = require("@stellar-did-credit/zk-wasm");
+      jest.spyOn(ZkWasm, "generate_score_proof").mockReturnValueOnce(new Uint8Array());
+      
+      const proof = await sdk.generateScoreProof(subjectAddress, 600);
+      expect(proof).toBeInstanceOf(Uint8Array);
     });
   });
 
@@ -2345,7 +2831,20 @@ describe("parseContractErrorCode", () => {
       throwContractError("Error(Contract, #19)", "governance"),
     ).toThrow(new GovernanceError(19, "InvalidVotingPeriod (code 19)"));
   });
+
+  it("maps InvalidAmount credit-oracle errors to their variant name", () => {
+    expect(() =>
+      throwContractError("Error(Contract, #17)", "credit-oracle"),
+    ).toThrow(new CreditOracleError(17, "InvalidAmount (code 17)"));
+  });
+
+  it("maps InvalidIssuerTier identity-oracle errors to their variant name", () => {
+    expect(() =>
+      throwContractError("Error(Contract, #11)", "identity-oracle"),
+    ).toThrow(new IdentityOracleError(11, "InvalidIssuerTier (code 11)"));
+  });
 });
+
 
 describe("batchRevokeVC", () => {
   beforeEach(() => {
@@ -2549,6 +3048,239 @@ describe("batchRevokeVC", () => {
         method: "set_recency_decay",
       });
       expect(mockSendTransaction).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe("pause and upgrade helpers", () => {
+    const adminKeypair = { publicKey: () => "GADMINAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" };
+    const validWasmHash = Buffer.alloc(32, 1);
+    const invalidWasmHash = Buffer.alloc(16, 1);
+
+    it("pauseIdentityOracle submits a signed transaction to identity-oracle", async () => {
+      mockSimulateTransaction.mockResolvedValueOnce({
+        result: { retval: { value: null } },
+      });
+
+      const sdk = new StellarDIDCreditSDK(mockConfig);
+      const txHash = await sdk.pauseIdentityOracle(adminKeypair as never);
+
+      expect(txHash).toBe("mock-tx-hash");
+      expect(mockContractCalls[0]).toMatchObject({
+        contractId: mockConfig.identityOracleId,
+        method: "pause",
+        args: [],
+      });
+      expect(mockSendTransaction).toHaveBeenCalledTimes(1);
+    });
+
+    it("unpauseIdentityOracle submits a signed transaction to identity-oracle", async () => {
+      mockSimulateTransaction.mockResolvedValueOnce({
+        result: { retval: { value: null } },
+      });
+
+      const sdk = new StellarDIDCreditSDK(mockConfig);
+      const txHash = await sdk.unpauseIdentityOracle(adminKeypair as never);
+
+      expect(txHash).toBe("mock-tx-hash");
+      expect(mockContractCalls[0]).toMatchObject({
+        contractId: mockConfig.identityOracleId,
+        method: "unpause",
+        args: [],
+      });
+      expect(mockSendTransaction).toHaveBeenCalledTimes(1);
+    });
+
+    it("pauseCreditOracle submits a signed transaction with admin address to credit-oracle", async () => {
+      mockSimulateTransaction.mockResolvedValueOnce({
+        result: { retval: { value: null } },
+      });
+
+      const sdk = new StellarDIDCreditSDK(mockConfig);
+      const txHash = await sdk.pauseCreditOracle(adminKeypair as never);
+
+      expect(txHash).toBe("mock-tx-hash");
+      expect(mockContractCalls[0]).toMatchObject({
+        contractId: mockConfig.creditOracleId,
+        method: "pause",
+      });
+      expect(mockContractCalls[0].args).toHaveLength(1);
+      expect(mockSendTransaction).toHaveBeenCalledTimes(1);
+    });
+
+    it("unpauseCreditOracle submits a signed transaction with admin address to credit-oracle", async () => {
+      mockSimulateTransaction.mockResolvedValueOnce({
+        result: { retval: { value: null } },
+      });
+
+      const sdk = new StellarDIDCreditSDK(mockConfig);
+      const txHash = await sdk.unpauseCreditOracle(adminKeypair as never);
+
+      expect(txHash).toBe("mock-tx-hash");
+      expect(mockContractCalls[0]).toMatchObject({
+        contractId: mockConfig.creditOracleId,
+        method: "unpause",
+      });
+      expect(mockContractCalls[0].args).toHaveLength(1);
+      expect(mockSendTransaction).toHaveBeenCalledTimes(1);
+    });
+
+    it("pauseRevocationRegistry submits a signed transaction to revocation-registry", async () => {
+      mockSimulateTransaction.mockResolvedValueOnce({
+        result: { retval: { value: null } },
+      });
+
+      const sdk = new StellarDIDCreditSDK(mockConfig);
+      const txHash = await sdk.pauseRevocationRegistry(adminKeypair as never);
+
+      expect(txHash).toBe("mock-tx-hash");
+      expect(mockContractCalls[0]).toMatchObject({
+        contractId: mockConfig.revocationRegistryId,
+        method: "pause",
+        args: [],
+      });
+      expect(mockSendTransaction).toHaveBeenCalledTimes(1);
+    });
+
+    it("unpauseRevocationRegistry submits a signed transaction to revocation-registry", async () => {
+      mockSimulateTransaction.mockResolvedValueOnce({
+        result: { retval: { value: null } },
+      });
+
+      const sdk = new StellarDIDCreditSDK(mockConfig);
+      const txHash = await sdk.unpauseRevocationRegistry(adminKeypair as never);
+
+      expect(txHash).toBe("mock-tx-hash");
+      expect(mockContractCalls[0]).toMatchObject({
+        contractId: mockConfig.revocationRegistryId,
+        method: "unpause",
+        args: [],
+      });
+      expect(mockSendTransaction).toHaveBeenCalledTimes(1);
+    });
+
+    it("upgradeIdentityOracle submits a signed transaction with 32-byte wasm hash", async () => {
+      mockSimulateTransaction.mockResolvedValueOnce({
+        result: { retval: { value: null } },
+      });
+
+      const sdk = new StellarDIDCreditSDK(mockConfig);
+      const txHash = await sdk.upgradeIdentityOracle(
+        adminKeypair as never,
+        validWasmHash,
+      );
+
+      expect(txHash).toBe("mock-tx-hash");
+      expect(mockContractCalls[0]).toMatchObject({
+        contractId: mockConfig.identityOracleId,
+        method: "upgrade",
+      });
+      expect(mockContractCalls[0].args).toHaveLength(1);
+      expect(mockSendTransaction).toHaveBeenCalledTimes(1);
+    });
+
+    it("upgradeIdentityOracle rejects invalid wasm hash", async () => {
+      const sdk = new StellarDIDCreditSDK(mockConfig);
+
+      await expect(
+        sdk.upgradeIdentityOracle(adminKeypair as never, invalidWasmHash),
+      ).rejects.toThrow("newWasmHash must be a 32-byte Buffer");
+
+      await expect(
+        sdk.upgradeIdentityOracle(
+          adminKeypair as never,
+          "not-a-buffer" as unknown as Buffer,
+        ),
+      ).rejects.toThrow("newWasmHash must be a 32-byte Buffer");
+    });
+
+    it("upgradeRevocationRegistry submits a signed transaction with 32-byte wasm hash", async () => {
+      mockSimulateTransaction.mockResolvedValueOnce({
+        result: { retval: { value: null } },
+      });
+
+      const sdk = new StellarDIDCreditSDK(mockConfig);
+      const txHash = await sdk.upgradeRevocationRegistry(
+        adminKeypair as never,
+        validWasmHash,
+      );
+
+      expect(txHash).toBe("mock-tx-hash");
+      expect(mockContractCalls[0]).toMatchObject({
+        contractId: mockConfig.revocationRegistryId,
+        method: "upgrade",
+      });
+      expect(mockContractCalls[0].args).toHaveLength(1);
+      expect(mockSendTransaction).toHaveBeenCalledTimes(1);
+    });
+
+    it("upgradeRevocationRegistry rejects invalid wasm hash", async () => {
+      const sdk = new StellarDIDCreditSDK(mockConfig);
+
+      await expect(
+        sdk.upgradeRevocationRegistry(adminKeypair as never, invalidWasmHash),
+      ).rejects.toThrow("newWasmHash must be a 32-byte Buffer");
+
+      await expect(
+        sdk.upgradeRevocationRegistry(
+          adminKeypair as never,
+          "not-a-buffer" as unknown as Buffer,
+        ),
+      ).rejects.toThrow("newWasmHash must be a 32-byte Buffer");
+    });
+
+    it("upgradeCreditOracle submits a signed transaction with admin address and 32-byte wasm hash", async () => {
+      mockSimulateTransaction.mockResolvedValueOnce({
+        result: { retval: { value: null } },
+      });
+
+      const sdk = new StellarDIDCreditSDK(mockConfig);
+      const txHash = await sdk.upgradeCreditOracle(
+        adminKeypair as never,
+        validWasmHash,
+      );
+
+      expect(txHash).toBe("mock-tx-hash");
+      expect(mockContractCalls[0]).toMatchObject({
+        contractId: mockConfig.creditOracleId,
+        method: "upgrade",
+      });
+      expect(mockContractCalls[0].args).toHaveLength(2);
+      expect(mockSendTransaction).toHaveBeenCalledTimes(1);
+    });
+
+    it("upgradeCreditOracle rejects invalid wasm hash", async () => {
+      const sdk = new StellarDIDCreditSDK(mockConfig);
+
+      await expect(
+        sdk.upgradeCreditOracle(adminKeypair as never, invalidWasmHash),
+      ).rejects.toThrow("newWasmHash must be a 32-byte Buffer");
+
+      await expect(
+        sdk.upgradeCreditOracle(
+          adminKeypair as never,
+          "not-a-buffer" as unknown as Buffer,
+        ),
+      ).rejects.toThrow("newWasmHash must be a 32-byte Buffer");
+    });
+
+    it("throws typed ContractError if simulation fails", async () => {
+      mockSimulateTransaction.mockResolvedValueOnce({
+        error: "HostError: Error(Contract, #2)",
+      });
+
+      const sdk = new StellarDIDCreditSDK(mockConfig);
+      await expect(
+        sdk.pauseIdentityOracle(adminKeypair as never),
+      ).rejects.toThrow(IdentityOracleError);
+    });
+
+    it("throws unexpected response error if simulation is not successful", async () => {
+      mockSimulateTransaction.mockResolvedValueOnce({});
+
+      const sdk = new StellarDIDCreditSDK(mockConfig);
+      await expect(
+        sdk.pauseCreditOracle(adminKeypair as never),
+      ).rejects.toThrow("Simulation returned unexpected response");
     });
   });
 });

@@ -17,6 +17,11 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
 
+      - name: Install wasm-pack
+        run: |
+          cargo install wasm-pack --version 0.13.1 --locked
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -28,6 +33,11 @@ jobs:
 
       - name: Run tests (regenerate snapshots if needed)
         run: SOROBAN_TEST_SNAPSHOT_FILE_UPDATE=true cargo test --workspace
+
+      - name: Run cargo deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
 
       - name: Run clippy
         run: cargo clippy --workspace -- -D warnings
@@ -104,9 +114,19 @@ jobs:
       - name: Install pnpm
         uses: pnpm/action-setup@v4
 
-      - name: Install SDK dependencies
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Install dependencies
         run: pnpm install --frozen-lockfile
-        working-directory: packages/sdk
+
+      - name: Build zk-wasm
+        run: pnpm --filter @stellar-did-credit/zk-wasm build
 
       - name: Run TypeScript SDK tests
         run: pnpm run test --coverage

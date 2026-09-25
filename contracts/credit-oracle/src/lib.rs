@@ -1395,6 +1395,9 @@ impl CreditOracle {
     /// identity-oracle instead of reading the cached `VcCount` storage key.
     /// This enables live VC count resolution that automatically excludes revoked VCs.
     ///
+    /// Emits an `IdOSet` event with the new identity oracle address so indexers
+    /// and monitoring tools can detect configuration changes.
+    ///
     /// Auth: admin only.
     pub fn set_identity_oracle(
         env: Env,
@@ -1417,7 +1420,7 @@ impl CreditOracle {
             .instance()
             .set(&DataKey::IdentityOracleId, &identity_oracle_id);
         env.events()
-            .publish((symbol_short!("IdOracle"),), identity_oracle_id);
+            .publish((symbol_short!("IdOSet"),), identity_oracle_id);
         Ok(())
     }
 
@@ -2531,6 +2534,40 @@ mod tests {
     }
 
     #[test]
+    fn test_list_feeders_empty_index_returns_empty_vec() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, CreditOracle);
+        let client = CreditOracleClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        // No feeder ever registered -> FeedersIndex unset -> empty Vec.
+        assert_eq!(
+            client.list_feeders(),
+            Vec::<Address>::new(&env)
+        );
+    }
+
+    #[test]
+    fn test_list_lenders_empty_index_returns_empty_vec() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, CreditOracle);
+        let client = CreditOracleClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        // No lender ever registered -> LendersIndex unset -> empty Vec.
+        assert_eq!(
+            client.list_lenders(),
+            Vec::<Address>::new(&env)
+        );
+    }
+
+    #[test]
     fn test_reregistering_deregistered_feeder_does_not_duplicate_index() {
         let env = Env::default();
         env.mock_all_auths();
@@ -2561,6 +2598,94 @@ mod tests {
             index.len()
         });
         assert_eq!(index_len, 1);
+    }
+
+    #[test]
+    fn test_deregister_feeder_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, CreditOracle);
+        let client = CreditOracleClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let feeder = Address::generate(&env);
+        client.initialize(&admin);
+        client.register_feeder(&admin, &feeder);
+
+        // Clear any existing events
+        env.events().all();
+
+        // Deregister the feeder
+        client.deregister_feeder(&admin, &feeder);
+
+        // Retrieve all emitted events
+        let events = env.events().all();
+
+        // Should be exactly one event (the FdrDeReg event)
+        assert_eq!(events.len(), 1, "expected exactly one event");
+
+        let (event_contract_id, topics, data) = events.get(0).unwrap();
+
+        // Verify the event was emitted by this contract
+        assert_eq!(event_contract_id, contract_id, "event contract id mismatch");
+
+        // Verify the topic is Symbol("FdrDeReg")
+        assert_eq!(topics.len(), 1, "expected 1 topic element");
+        let topic_val = topics.get(0).unwrap();
+        let topic_sym: Symbol = topic_val
+            .try_into_val(&env)
+            .expect("topic should be a Symbol");
+        assert_eq!(topic_sym, symbol_short!("FdrDeReg"), "expected FdrDeReg topic");
+
+        // Verify the data payload is the feeder address
+        let event_feeder: Address = data
+            .try_into_val(&env)
+            .expect("data should be Address");
+        assert_eq!(event_feeder, feeder, "event feeder mismatch");
+    }
+
+    #[test]
+    fn test_deregister_lender_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, CreditOracle);
+        let client = CreditOracleClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let lender = Address::generate(&env);
+        client.initialize(&admin);
+        client.register_lender(&admin, &lender);
+
+        // Clear any existing events
+        env.events().all();
+
+        // Deregister the lender
+        client.deregister_lender(&admin, &lender);
+
+        // Retrieve all emitted events
+        let events = env.events().all();
+
+        // Should be exactly one event (the LndDeReg event)
+        assert_eq!(events.len(), 1, "expected exactly one event");
+
+        let (event_contract_id, topics, data) = events.get(0).unwrap();
+
+        // Verify the event was emitted by this contract
+        assert_eq!(event_contract_id, contract_id, "event contract id mismatch");
+
+        // Verify the topic is Symbol("LndDeReg")
+        assert_eq!(topics.len(), 1, "expected 1 topic element");
+        let topic_val = topics.get(0).unwrap();
+        let topic_sym: Symbol = topic_val
+            .try_into_val(&env)
+            .expect("topic should be a Symbol");
+        assert_eq!(topic_sym, symbol_short!("LndDeReg"), "expected LndDeReg topic");
+
+        // Verify the data payload is the lender address
+        let event_lender: Address = data
+            .try_into_val(&env)
+            .expect("data should be Address");
+        assert_eq!(event_lender, lender, "event lender mismatch");
     }
 
     #[test]
@@ -2702,6 +2827,45 @@ mod tests {
         let result = client.get_identity_oracle();
         assert!(result.is_some());
         assert_eq!(result.unwrap(), identity_oracle_id);
+    }
+
+    #[test]
+    fn test_set_identity_oracle_emits_idoset() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, CreditOracle);
+        let client = CreditOracleClient::new(&env, &contract_id);
+
+        let identity_oracle_id = env.register_contract(None, identity_oracle::IdentityOracle);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        client.set_identity_oracle(&admin, &identity_oracle_id);
+
+        let events = env.events().all();
+        // Filter for the IdOSet event from this contract (robust to
+        // additional setup events such as Initialized).
+        let mut idoset_count = 0u32;
+        for (event_contract_id, topics, data) in events.iter() {
+            if event_contract_id != contract_id || topics.len() != 1 {
+                continue;
+            }
+            let topic_sym: Symbol = topics
+                .get(0)
+                .unwrap()
+                .try_into_val(&env)
+                .expect("topic should be a Symbol");
+            if topic_sym != symbol_short!("IdOSet") {
+                continue;
+            }
+            let event_oracle: Address = data.try_into_val(&env).expect("data should be an Address");
+            assert_eq!(
+                event_oracle, identity_oracle_id,
+                "event data should be the new identity oracle address"
+            );
+            idoset_count += 1;
+        }
+        assert_eq!(idoset_count, 1, "expected exactly one IdOSet event");
     }
 
     #[test]

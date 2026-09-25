@@ -72,6 +72,9 @@ importers:
       '@types/jest':
         specifier: ^29.0.0
         version: 29.5.14
+      '@types/json-schema':
+        specifier: ^7.0.15
+        version: 7.0.15
       '@types/node':
         specifier: ^20.0.0
         version: 20.19.43
@@ -139,6 +142,9 @@ importers:
 
   packages/sdk:
     dependencies:
+      '@stellar-did-credit/zk-wasm':
+        specifier: workspace:*
+        version: link:../zk-wasm
       '@stellar/stellar-sdk':
         specifier: ^12.0.0
         version: 12.3.0
@@ -170,6 +176,8 @@ importers:
       typescript:
         specifier: ^5.0.0
         version: 5.9.3
+
+  packages/zk-wasm: {}
 
 packages:
 
@@ -562,6 +570,9 @@ packages:
 
   '@types/jest@29.5.14':
     resolution: {integrity: sha512-ZN+4sdnLUbo8EVvVc2ao0GFW6oVrQRPn4K2lglySj7APvSrgzxHiNNK99us4WDMi57xxA2yggblIAMNhXOotLQ==}
+
+  '@types/json-schema@7.0.15':
+    resolution: {integrity: sha512-5+fP8P8MFNC+AyZCDxrB2pkZFPGzqQWUzpSeuuVLvm8VMcorNYavBqoFcxK8bQz4Qsbn4oUEEem4wDLfcysGHA==}
 
   '@types/node@20.19.43':
     resolution: {integrity: sha512-6oYBAi5ikg4Pl+kGsoYtawUMBT2zZMCvPNF7pVLnHZfd1zf38DRiWn/gT01RYCdUqkv7Fhr+C9ot4/tb+2sVvA==}
@@ -2785,6 +2796,8 @@ snapshots:
     dependencies:
       expect: 29.7.0
       pretty-format: 29.7.0
+
+  '@types/json-schema@7.0.15': {}
 
   '@types/node@20.19.43':
     dependencies:

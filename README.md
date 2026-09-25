@@ -117,7 +117,7 @@ Computes and stores credit scores based on on-chain data.
 | `list_feeders()`                                     | Returns all currently registered feeders           |
 | `list_lenders()`                                     | Returns all currently registered lenders           |
 | `update_tx_stats(feeder, subject, stats)`            | Updates 30-day transaction statistics              |
-| `record_repayment(lender, subject, amount, on_time)` | Records a loan repayment outcome                   |
+| `record_repayment(lender, subject, amount, on_time)` | Records a loan repayment outcome. Returns InvalidAmount if amount ≤ 0. |
 | `compute_score(subject)`                             | Computes and persists the credit score             |
 | `get_score(subject)`                                 | Returns the latest ScoreRecord                     |
 | `propose_weights(weights)`                           | Proposes new weights with 24h timelock             |
@@ -140,7 +140,8 @@ On-chain proposal creation, weighted voting, and multi-step execution for updati
 | `update_voter_weight(admin, voter, weight)`                | Admin updates or deregisters a voter (weight = 0)      |
 | `set_quorum(admin, quorum_required)`                       | Admin sets the default quorum for future proposals     |
 | `get_proposal(proposal_id)`                                | Returns a proposal by ID                               |
-| `cancel(canceller, proposal_id, reason)`                   | Emits a cancellation event (stub — no on-chain effect) |
+| `list_voters()`                                            | Returns all registered voters with their current weights. |
+| `cancel_proposal(canceller, proposal_id)`                  | Proposer/admin cancels; sets `cancelled: bool`, blocks further voting/execution |
 
 ### revocation-registry
 
@@ -152,6 +153,7 @@ Maintains an on-chain list of revoked credential hashes.
 | `revoke(issuer, vc_hash)`         | Revokes a credential by hash                    |
 | `batch_revoke(issuer, vc_hashes)` | Revokes multiple credentials in one transaction |
 | `is_revoked(vc_hash)`             | Returns true if the credential has been revoked |
+| `list_revoked_for_issuer(issuer)` | Returns all VC hashes revoked by the issuer    |
 | `upgrade(admin, new_wasm_hash)`   | Upgrades the contract WASM in-place             |
 
 ### score-range-verifier
@@ -473,6 +475,31 @@ await feeder.runCycle();
 
 ## Component status
 
+| Component               | Status         | Notes                                |
+| ----------------------- | -------------- | ------------------------------------ |
+| identity-oracle         | ✅ Complete    | All functions implemented and tested |
+| credit-oracle           | ✅ Complete    | Scoring formula live on testnet      |
+| revocation-registry     | ✅ Complete    | Batch revocation supported           |
+| score-range-verifier    | 🚧 In progress | Placeholder VK; real trusted setup required before testnet use. |
+| TypeScript SDK          | 🚧 In progress | `getScore` done, rest open           |
+| Feeder                  | ✅ Complete    | Reference impl in `packages/feeder`  |
+| CLI tool                | ✅ Complete    | `packages/cli`                       |
+| Cross-contract vc_count | 📋 Planned     |                                      |
+| ZK proof layer          | 📋 Research    |                                      |
+| Governance contract     | 📋 Planned     |                                      |
+| Component               | Status         | Notes                                                                |
+| ----------------------- | -------------- | -------------------------------------------------------------------- |
+| identity-oracle         | ✅ Complete    | All functions implemented and tested                                 |
+| credit-oracle           | ✅ Complete    | Scoring formula live on testnet                                      |
+| revocation-registry     | ✅ Complete    | Batch revocation supported                                           |
+| governance              | ✅ Complete    | Admin-registered voter weights, double timelock, see [docs/governance.md](docs/governance.md) |
+| score-range-verifier    | 🚧 In progress | Placeholder VK; real trusted setup required before testnet use.     |
+| TypeScript SDK          | 🚧 In progress | Core identity, credit, revocation, and governance helpers available |
+| Feeder                  | ✅ Complete    | Reference impl in `packages/feeder`                                  |
+| CLI tool                | 📋 Planned     |                                                                      |
+| Cross-contract vc_count | 📋 Planned     |                                                                      |
+| ZK proof layer          | 📋 Research    |                                                                      |
+| Token-weighted DAO vote | 📋 Planned     | Current governance uses admin-assigned weights; token model is future |
 | Component               | Status         | Notes                                                                                         |
 | ----------------------- | -------------- | --------------------------------------------------------------------------------------------- |
 | identity-oracle         | ✅ Complete    | All functions implemented and tested                                                          |
