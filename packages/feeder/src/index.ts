@@ -904,6 +904,20 @@ export class Feeder {
     private config: FeederConfig,
     private feederKeypair: Keypair,
   ) {
+    // #930: validate revocationRegistryId at construction time so both the CLI
+    // and programmatic callers (`new Feeder(config, keypair)`) fail fast on
+    // a malformed address. The CLI's own REVOCATION_REGISTRY_ID check remains
+    // for env-var diagnostics, but this is the enforcement point every
+    // instance passes through.
+    if (
+      config.revocationRegistryId !== undefined &&
+      !isValidSorobanContractId(config.revocationRegistryId)
+    ) {
+      throw new Error(
+        `revocationRegistryId must be a valid Soroban contract ID (C-address): "${config.revocationRegistryId}"`,
+      );
+    }
+
     // #954: validate governanceId at construction time so both the CLI
     // and programmatic callers (`new Feeder(config, keypair)`) fail fast on
     // a malformed address. The CLI's own GOVERNANCE_ID check remains for
