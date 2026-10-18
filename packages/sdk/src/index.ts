@@ -2985,7 +2985,6 @@ export class StellarDIDCreditSDK {
    * Uses a read-only simulation against the identity-oracle contract.
    *
    * @returns Array of Stellar G... addresses of registered issuers
-   * @alias listIssuers
    */
   async getRegisteredIssuers(): Promise<string[]> {
     return this.listIssuers();
