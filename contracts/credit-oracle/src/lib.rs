@@ -1,6 +1,7 @@
 #![no_std]
 pub use credit_oracle_types::{
-    CredentialType, CreditOracleError, IdentityOracleClient, PendingWeightsRecord, ScoringWeights,
+    CredentialType, CreditOracleError, IdentityOracleClient, IdentityVCRecord,
+    PendingWeightsRecord, ScoringWeights,
 };
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, IntoVal, String,
@@ -99,7 +100,7 @@ pub enum DataKey {
 /// Basis-point denominator: 10_000 bps == 1.00x multiplier.
 pub const BPS_DENOMINATOR: u32 = 10_000;
 
-/// Seconds in one day. `VCRecord.anchored_at` is a ledger timestamp in Unix
+/// Seconds in one day. `IdentityVCRecord.anchored_at` is a ledger timestamp in Unix
 /// seconds, so credential age must be divided by this to obtain whole days.
 pub const SECONDS_PER_DAY: u64 = 86_400;
 
@@ -313,20 +314,6 @@ pub struct VcEntry {
     /// Optional credential type label (e.g., "kyc", "employment").
     /// `None` defaults to weight 100.
     pub vc_type: Option<Symbol>,
-}
-
-/// An on-chain anchor record for a verifiable credential in the identity oracle.
-#[contracttype]
-#[derive(Clone)]
-pub struct IdentityVCRecord {
-    /// SHA-256 hash of the off-chain verifiable credential JSON.
-    pub vc_hash: BytesN<32>,
-    /// Address of the issuer who anchored this credential.
-    pub issuer: Address,
-    /// Ledger timestamp (Unix seconds) when this credential was anchored.
-    pub anchored_at: u64,
-    /// Whether this credential has been revoked by the issuer.
-    pub revoked: bool,
 }
 
 /// Status of an on-chain score input dispute.
@@ -934,7 +921,7 @@ impl CreditOracle {
     /// When `enabled`, `compute_score` multiplies each credential's weighted
     /// points by
     ///   `max(min_recency_bps, 10_000 - age_days * decay_bps_per_day) / 10_000`
-    /// where `age_days` derives from `VCRecord.anchored_at`. Decay therefore
+    /// where `age_days` derives from `IdentityVCRecord.anchored_at`. Decay therefore
     /// only applies on the cross-contract path, which requires
     /// `set_identity_oracle` to have been called - `anchored_at` is only
     /// available from `get_vc_details`.

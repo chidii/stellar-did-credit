@@ -6,7 +6,9 @@
 //! and active-count queries used by the credit-oracle.
 #[cfg(test)]
 extern crate std;
-pub use credit_oracle_types::CredentialType;
+// `IdentityVCRecord` is shared with the credit-oracle, which decodes the
+// `get_vc_details` return value as this same type (issue #932).
+pub use credit_oracle_types::{CredentialType, IdentityVCRecord};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
     IntoVal, String, Symbol, TryFromVal, Val, Vec,
@@ -182,20 +184,6 @@ pub enum DataKey {
     LastStateChange(Address),
 }
 
-/// An on-chain anchor record for a verifiable credential.
-#[contracttype]
-#[derive(Clone)]
-pub struct VCRecord {
-    /// SHA-256 hash of the off-chain verifiable credential JSON.
-    pub vc_hash: BytesN<32>,
-    /// Address of the issuer who anchored this credential.
-    pub issuer: Address,
-    /// Ledger timestamp (Unix seconds) when this credential was anchored.
-    pub anchored_at: u64,
-    /// Whether this credential has been revoked by the issuer.
-    pub revoked: bool,
-}
-
 const INSTANCE_BUMP_THRESHOLD: u32 = 5000;
 const INSTANCE_BUMP_AMOUNT: u32 = 500_000;
 
@@ -312,7 +300,7 @@ fn increment_vcs_revoked(env: &Env, count: u64) {
 /// Deployers must ensure the deployment order documented in
 /// `docs/mainnet-deployment.md` is followed to avoid silent
 /// misconfiguration.
-fn is_record_revoked(env: &Env, record: &VCRecord) -> bool {
+fn is_record_revoked(env: &Env, record: &IdentityVCRecord) -> bool {
     if record.revoked {
         return true;
     }
@@ -335,7 +323,7 @@ fn is_record_revoked(env: &Env, record: &VCRecord) -> bool {
 
 fn compute_active_vc_count(env: &Env, subject: &Address) -> u32 {
     let key = DataKey::VCAnchors(subject.clone());
-    let anchors: Vec<VCRecord> = env
+    let anchors: Vec<IdentityVCRecord> = env
         .storage()
         .persistent()
         .get(&key)
@@ -406,7 +394,7 @@ fn deactivate_core(env: &Env, subject: &Address) -> u32 {
 
     // 2. Revoke all VCs anchored for this subject
     let key = DataKey::VCAnchors(subject.clone());
-    let anchors: Vec<VCRecord> = env
+    let anchors: Vec<IdentityVCRecord> = env
         .storage()
         .persistent()
         .get(&key)
@@ -781,7 +769,7 @@ impl IdentityOracle {
         }
 
         let key = DataKey::VCAnchors(subject.clone());
-        let mut anchors: Vec<VCRecord> = env
+        let mut anchors: Vec<IdentityVCRecord> = env
             .storage()
             .persistent()
             .get(&key)
@@ -804,7 +792,7 @@ impl IdentityOracle {
             return Err(IdentityOracleError::VCLimitReached);
         }
 
-        let record = VCRecord {
+        let record = IdentityVCRecord {
             vc_hash: vc_hash.clone(),
             issuer: issuer.clone(),
             anchored_at: env.ledger().timestamp(),
@@ -852,7 +840,7 @@ impl IdentityOracle {
         ensure_not_paused(&env)?;
         issuer.require_auth();
         let key = DataKey::VCAnchors(subject.clone());
-        let anchors: Vec<VCRecord> = env
+        let anchors: Vec<IdentityVCRecord> = env
             .storage()
             .persistent()
             .get(&key)
@@ -988,7 +976,7 @@ impl IdentityOracle {
         }
 
         let key = DataKey::VCAnchors(subject);
-        let anchors: Vec<VCRecord> = env
+        let anchors: Vec<IdentityVCRecord> = env
             .storage()
             .persistent()
             .get(&key)
@@ -1005,7 +993,7 @@ impl IdentityOracle {
     /// Returns the total number of anchored VC records for `subject`, including revoked entries.
     pub fn get_total_vc_count(env: Env, subject: Address) -> u32 {
         let key = DataKey::VCAnchors(subject);
-        let anchors: Vec<VCRecord> = env
+        let anchors: Vec<IdentityVCRecord> = env
             .storage()
             .persistent()
             .get(&key)
@@ -1029,9 +1017,9 @@ impl IdentityOracle {
     ///
     /// Revocations from both on-chain flags and the linked revocation registry
     /// are excluded. Use this for credit scoring and verification audits.
-    pub fn get_vc_details(env: Env, subject: Address) -> Vec<VCRecord> {
+    pub fn get_vc_details(env: Env, subject: Address) -> Vec<IdentityVCRecord> {
         let key = DataKey::VCAnchors(subject);
-        let anchors: Vec<VCRecord> = env
+        let anchors: Vec<IdentityVCRecord> = env
             .storage()
             .persistent()
             .get(&key)
@@ -1055,7 +1043,7 @@ impl IdentityOracle {
     /// which returns only the active records.
     pub fn list_revoked_for_subject(env: Env, subject: Address) -> Vec<BytesN<32>> {
         let key = DataKey::VCAnchors(subject);
-        let anchors: Vec<VCRecord> = env
+        let anchors: Vec<IdentityVCRecord> = env
             .storage()
             .persistent()
             .get(&key)
@@ -1133,7 +1121,7 @@ impl IdentityOracle {
     /// exists. This function is read-only and does not require authentication.
     pub fn verify_vc(env: Env, subject: Address, vc_hash: BytesN<32>) -> bool {
         let key = DataKey::VCAnchors(subject);
-        let anchors: Vec<VCRecord> = env
+        let anchors: Vec<IdentityVCRecord> = env
             .storage()
             .persistent()
             .get(&key)

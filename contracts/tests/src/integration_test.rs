@@ -1861,6 +1861,65 @@ mod tests {
         assert_eq!(rec1_v2_updated.total_repaid, 5000);
     }
 
+    /// Issue #932: identity-oracle's `get_vc_details` and the credit-oracle's
+    /// cross-contract decode share one type, `IdentityVCRecord`.
+    ///
+    /// The second half decodes the call exactly the way `compute_score` does
+    /// (`invoke_contract::<Vec<IdentityVCRecord>>`), and both halves must see only
+    /// the active (non-revoked) records with every field intact.
+    #[test]
+    fn test_get_vc_details_decodes_as_shared_identity_vc_record() {
+        use soroban_sdk::IntoVal as _;
+
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(1_700_000_000);
+
+        let identity_id = env.register(IdentityOracle, ());
+        let identity = IdentityOracleClient::new(&env, &identity_id);
+
+        let admin = soroban_sdk::Address::generate(&env);
+        let issuer = soroban_sdk::Address::generate(&env);
+        let subject = soroban_sdk::Address::generate(&env);
+        identity.initialize(&admin);
+        identity.register_issuer(&issuer);
+
+        let hash_a = BytesN::from_array(&env, &[1u8; 32]);
+        let hash_b = BytesN::from_array(&env, &[2u8; 32]);
+        identity.anchor_vc(&issuer, &subject, &hash_a);
+        env.ledger().set_timestamp(1_700_000_500);
+        identity.anchor_vc(&issuer, &subject, &hash_b);
+
+        // Typed client return value.
+        let details = identity.get_vc_details(&subject);
+        assert_eq!(details.len(), 2);
+        let first = details.get(0).unwrap();
+        let second = details.get(1).unwrap();
+        assert_eq!(first.vc_hash, hash_a);
+        assert_eq!(first.issuer, issuer);
+        assert_eq!(first.anchored_at, 1_700_000_000);
+        assert!(!first.revoked);
+        assert_eq!(second.vc_hash, hash_b);
+        assert_eq!(second.anchored_at, 1_700_000_500);
+
+        // Decode as the credit-oracle does; it must be the same shared type.
+        let decoded = env.invoke_contract::<soroban_sdk::Vec<credit_oracle::IdentityVCRecord>>(
+            &identity_id,
+            &Symbol::new(&env, "get_vc_details"),
+            soroban_sdk::vec![&env, subject.clone().into_val(&env)],
+        );
+        assert_eq!(decoded.len(), 2);
+        let decoded_first: credit_oracle::IdentityVCRecord = decoded.get(0).unwrap();
+        assert_eq!(decoded_first.vc_hash, hash_a);
+        assert_eq!(decoded_first.anchored_at, 1_700_000_000);
+
+        // Revoked records drop out of both views.
+        identity.mark_vc_revoked(&issuer, &subject, &hash_a);
+        let remaining = identity.get_vc_details(&subject);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining.get(0).unwrap().vc_hash, hash_b);
+    }
+
     #[test]
     fn test_identity_oracle_migration_flow() {
         let env = Env::default();
@@ -1877,7 +1936,7 @@ mod tests {
         let mut hash_bytes = [0u8; 32];
         hash_bytes[0] = 42;
         let vc_hash = BytesN::from_array(&env, &hash_bytes);
-        let vc_record = identity_oracle::VCRecord {
+        let vc_record = identity_oracle::IdentityVCRecord {
             vc_hash: vc_hash.clone(),
             issuer: issuer.clone(),
             anchored_at: env.ledger().timestamp(),

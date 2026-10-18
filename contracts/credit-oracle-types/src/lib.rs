@@ -8,6 +8,25 @@
 
 use soroban_sdk::{contracterror, contracttype, Address, BytesN, Env, IntoVal, Symbol};
 
+/// An on-chain anchor record for a verifiable credential in the identity oracle.
+///
+/// This is the single definition shared by both contracts: the identity-oracle
+/// stores it and returns it from `get_vc_details`, and the credit-oracle decodes
+/// it from that same cross-contract call (it needs `anchored_at` for recency
+/// decay). Keeping one type means the two sides cannot drift apart.
+#[contracttype]
+#[derive(Clone)]
+pub struct IdentityVCRecord {
+    /// SHA-256 hash of the off-chain verifiable credential JSON.
+    pub vc_hash: BytesN<32>,
+    /// Address of the issuer who anchored this credential.
+    pub issuer: Address,
+    /// Ledger timestamp (Unix seconds) when this credential was anchored.
+    pub anchored_at: u64,
+    /// Whether this credential has been revoked by the issuer.
+    pub revoked: bool,
+}
+
 /// Minimum weight allowed for any individual scoring weight component (10%).
 /// Every component must contribute at least 10% to prevent degenerate scoring
 /// (e.g., setting a component weight to 0 silently disables that metric).
